@@ -91,6 +91,8 @@ ENDPOINTS = {
     "campaigns_all":        "/email/public/v1/campaigns/by-id",
     "campaigns_detail":     "/email/public/v1/campaigns/{campaign_id}",
 
+    "marketing_campaigns":  "/marketing/v3/campaigns",
+
     "engagements_all":        "/engagements/v1/engagements/paged",
 
     "subscription_changes": "/email/public/v1/subscriptions/timeline",
@@ -808,6 +810,16 @@ def sync_campaigns(STATE, ctx):
     return STATE
 
 
+def sync_marketing_campaigns(STATE, ctx):
+    stream_id = "marketing_campaigns"
+    params = {
+        'limit': 100,
+        'properties': 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_audience,hs_currency_code,hs_campaign_status,hs_utm,hs_owner,hs_color_hex,hs_created_by_user_id,hs_object_id,hs_budget_items_sum_amount,hs_spend_items_sum_amount',
+        'sort': '-updatedAt',
+    }
+    return sync_v3_stream(STATE, ctx, stream_id, params)
+
+
 def sync_entity_chunked(STATE, catalog, entity_name, key_properties, path):
     schema = load_schema(entity_name)
     bookmark_key = 'startTimestamp'
@@ -1167,6 +1179,7 @@ STREAMS = [
     Stream('workflows', sync_workflows, ['id'], 'updatedAt', 'INCREMENTAL'),
     Stream('contact_lists', sync_contact_lists, ["listId"], 'updatedAt', 'INCREMENTAL'),
     Stream('engagements', sync_engagements, ["engagement_id"], 'lastUpdated', 'INCREMENTAL'),
+    Stream('marketing_campaigns', sync_marketing_campaigns, ['id'], 'updatedAt', 'INCREMENTAL'),
 
     # Do these last as they are full table
     Stream('campaigns', sync_campaigns, ["id"], None, 'FULL_TABLE'),
