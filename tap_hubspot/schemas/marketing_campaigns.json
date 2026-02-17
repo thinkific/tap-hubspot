@@ -59,6 +59,45 @@
         }
       }
     },
+    "assets": {
+      "type": ["null", "object"],
+      "additionalProperties": {
+        "type": ["null", "object"],
+        "properties": {
+          "results": {
+            "type": ["null", "array"],
+            "items": {
+              "type": ["null", "object"],
+              "properties": {
+                "id": {
+                  "type": ["null", "string"]
+                },
+                "name": {
+                  "type": ["null", "string"]
+                },
+                "metrics": {
+                  "type": ["null", "object"],
+                  "additionalProperties": {
+                    "type": ["null", "number"]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "businessUnits": {
+      "type": ["null", "array"],
+      "items": {
+        "type": ["null", "object"],
+        "properties": {
+          "id": {
+            "type": ["null", "integer"]
+          }
+        }
+      }
+    },
     "property_hs_name": {
       "type": ["null", "string"]
     },

@@ -91,7 +91,8 @@ ENDPOINTS = {
     "campaigns_all":        "/email/public/v1/campaigns/by-id",
     "campaigns_detail":     "/email/public/v1/campaigns/{campaign_id}",
 
-    "marketing_campaigns":  "/marketing/v3/campaigns",
+    "marketing_campaigns":          "/marketing/v3/campaigns",
+    "marketing_campaigns_detail":   "/marketing/v3/campaigns/{campaign_guid}",
 
     "engagements_all":        "/engagements/v1/engagements/paged",
 
@@ -812,12 +813,45 @@ def sync_campaigns(STATE, ctx):
 
 def sync_marketing_campaigns(STATE, ctx):
     stream_id = "marketing_campaigns"
+    catalog = ctx.get_catalog_from_id(singer.get_currently_syncing(STATE))
+    mdata = metadata.to_map(catalog.get('metadata'))
+
+    bookmark_key = "updatedAt"
+    bookmark_value = utils.strptime_with_tz(
+        get_start(STATE, stream_id, bookmark_key))
+    max_bk_value = bookmark_value
+    LOGGER.info("Sync %s from %s", stream_id, bookmark_value)
+
+    schema = load_schema(stream_id)
+    singer.write_schema(stream_id, schema, ["id"],
+                        [bookmark_key], catalog.get('stream_alias'))
+
+    url = get_url(stream_id)
     params = {
         'limit': 100,
         'properties': 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_audience,hs_currency_code,hs_campaign_status,hs_utm,hs_owner,hs_color_hex,hs_created_by_user_id,hs_object_id,hs_budget_items_sum_amount,hs_spend_items_sum_amount',
         'sort': '-updatedAt',
     }
-    return sync_v3_stream(STATE, ctx, stream_id, params)
+
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as transformer:
+        sync_start_time = utils.now()
+        with metrics.record_counter(stream_id) as counter:
+            for row in get_v3_records(url, params, 'results', "paging"):
+                modified_time = utils.strptime_to_utc(row[bookmark_key])
+
+                if modified_time and modified_time >= bookmark_value:
+                    detail = request(get_url("marketing_campaigns_detail", campaign_guid=row['id'])).json()
+                    record = transformer.transform(lift_properties_and_versions(detail), schema, mdata)
+                    singer.write_record(stream_id, record, catalog.get(
+                        'stream_alias'), time_extracted=utils.now())
+                    if modified_time >= max_bk_value:
+                        max_bk_value = modified_time
+                    counter.increment()
+
+    new_bookmark = min(max_bk_value, sync_start_time)
+    STATE = singer.write_bookmark(STATE, stream_id, bookmark_key, utils.strftime(new_bookmark))
+    singer.write_state(STATE)
+    return STATE
 
 
 def sync_entity_chunked(STATE, catalog, entity_name, key_properties, path):
