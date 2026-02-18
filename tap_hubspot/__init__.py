@@ -827,9 +827,13 @@ def sync_marketing_campaigns(STATE, ctx):
                         [bookmark_key], catalog.get('stream_alias'))
 
     url = get_url(stream_id)
+    property_fields = ['hs_name', 'hs_start_date', 'hs_end_date', 'hs_notes', 'hs_audience',
+                        'hs_currency_code', 'hs_campaign_status', 'hs_utm', 'hs_owner',
+                        'hs_color_hex', 'hs_created_by_user_id', 'hs_object_id',
+                        'hs_budget_items_sum_amount', 'hs_spend_items_sum_amount']
     params = {
         'limit': 100,
-        'properties': 'hs_name,hs_start_date,hs_end_date,hs_notes,hs_audience,hs_currency_code,hs_campaign_status,hs_utm,hs_owner,hs_color_hex,hs_created_by_user_id,hs_object_id,hs_budget_items_sum_amount,hs_spend_items_sum_amount',
+        'properties': property_fields,
         'sort': '-updatedAt',
     }
 
@@ -841,6 +845,7 @@ def sync_marketing_campaigns(STATE, ctx):
 
                 if modified_time and modified_time >= bookmark_value:
                     detail = request(get_url("marketing_campaigns_detail", campaign_guid=row['id'])).json()
+                    detail['properties'] = row.get('properties', {})
                     record = transformer.transform(lift_properties_and_versions(detail), schema, mdata)
                     singer.write_record(stream_id, record, catalog.get(
                         'stream_alias'), time_extracted=utils.now())
