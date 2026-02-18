@@ -1,0 +1,144 @@
+{
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": ["null", "string"]
+    },
+    "createdAt": {
+      "type": ["null", "string"],
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": ["null", "string"],
+      "format": "date-time"
+    },
+    "properties": {
+      "type": "object",
+      "properties": {
+        "hs_name": {
+          "type": ["null", "string"]
+        },
+        "hs_start_date": {
+          "type": ["null", "string"]
+        },
+        "hs_end_date": {
+          "type": ["null", "string"]
+        },
+        "hs_notes": {
+          "type": ["null", "string"]
+        },
+        "hs_audience": {
+          "type": ["null", "string"]
+        },
+        "hs_currency_code": {
+          "type": ["null", "string"]
+        },
+        "hs_campaign_status": {
+          "type": ["null", "string"]
+        },
+        "hs_utm": {
+          "type": ["null", "string"]
+        },
+        "hs_owner": {
+          "type": ["null", "string"]
+        },
+        "hs_color_hex": {
+          "type": ["null", "string"]
+        },
+        "hs_created_by_user_id": {
+          "type": ["null", "string"]
+        },
+        "hs_object_id": {
+          "type": ["null", "string"]
+        },
+        "hs_budget_items_sum_amount": {
+          "type": ["null", "string"]
+        },
+        "hs_spend_items_sum_amount": {
+          "type": ["null", "string"]
+        }
+      }
+    },
+    "assets": {
+      "type": ["null", "object"],
+      "additionalProperties": {
+        "type": ["null", "object"],
+        "properties": {
+          "results": {
+            "type": ["null", "array"],
+            "items": {
+              "type": ["null", "object"],
+              "properties": {
+                "id": {
+                  "type": ["null", "string"]
+                },
+                "name": {
+                  "type": ["null", "string"]
+                },
+                "metrics": {
+                  "type": ["null", "object"],
+                  "additionalProperties": {
+                    "type": ["null", "number"]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "businessUnits": {
+      "type": ["null", "array"],
+      "items": {
+        "type": ["null", "object"],
+        "properties": {
+          "id": {
+            "type": ["null", "integer"]
+          }
+        }
+      }
+    },
+    "property_hs_name": {
+      "type": ["null", "string"]
+    },
+    "property_hs_start_date": {
+      "type": ["null", "string"]
+    },
+    "property_hs_end_date": {
+      "type": ["null", "string"]
+    },
+    "property_hs_notes": {
+      "type": ["null", "string"]
+    },
+    "property_hs_audience": {
+      "type": ["null", "string"]
+    },
+    "property_hs_currency_code": {
+      "type": ["null", "string"]
+    },
+    "property_hs_campaign_status": {
+      "type": ["null", "string"]
+    },
+    "property_hs_utm": {
+      "type": ["null", "string"]
+    },
+    "property_hs_owner": {
+      "type": ["null", "string"]
+    },
+    "property_hs_color_hex": {
+      "type": ["null", "string"]
+    },
+    "property_hs_created_by_user_id": {
+      "type": ["null", "string"]
+    },
+    "property_hs_object_id": {
+      "type": ["null", "string"]
+    },
+    "property_hs_budget_items_sum_amount": {
+      "type": ["null", "string"]
+    },
+    "property_hs_spend_items_sum_amount": {
+      "type": ["null", "string"]
+    }
+  }
+}
