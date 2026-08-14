@@ -38,7 +38,7 @@ class TestClient():
                           max_tries=5,
                           jitter=None,
                           giveup=giveup,
-                          interval=10)
+                          interval=3)
 
     def get(self, url, params=dict()):
         """Perform a GET using the standard requests method and logs the action"""
@@ -55,7 +55,7 @@ class TestClient():
                           max_tries=5,
                           jitter=None,
                           giveup=giveup,
-                          interval=10)
+                          interval=3)
     def post(self, url, data=dict(), params=dict(), debug=DEBUG):
         """Perfroma a POST using the standard requests method and log the action"""
 
@@ -86,14 +86,14 @@ class TestClient():
                           max_tries=5,
                           jitter=None,
                           giveup=giveup,
-                          interval=10)
+                          interval=3)
     def put(self, url, data, params=dict(), debug=DEBUG):
         """Perfroma a PUT using the standard requests method and log the action"""
         headers = dict(self.HEADERS)
         headers['content-type'] = "application/json"
         response = requests.put(url, json=data, params=params, headers=headers)
         LOGGER.info(
-            f"TEST CLIENT | PUT {url} data={data} params={params}  STATUS: {response.status_code}")
+            f"TEST CLIENT | PUT {url} data={data} params={params}  STATUS: {response.text}")
         if debug:
             LOGGER.debug(response.text)
 
@@ -105,7 +105,7 @@ class TestClient():
                           max_tries=5,
                           jitter=None,
                           giveup=giveup,
-                          interval=10)
+                          interval=3)
     def patch(self, url, data, params=dict(), debug=DEBUG):
         """Perfroma a PATCH using the standard requests method and log the action"""
         headers = dict(self.HEADERS)
@@ -124,7 +124,7 @@ class TestClient():
                           max_tries=5,
                           jitter=None,
                           giveup=giveup,
-                          interval=10)
+                          interval=3)
     def delete(self, url, params=dict(), debug=DEBUG):
         """Perfroma a POST using the standard requests method and log the action"""
 
@@ -190,12 +190,16 @@ class TestClient():
 
         if stream == 'forms':
             return self.get_forms()
+        elif stream == 'form_submissions':
+            return self.get_form_submissions(parent_ids, pagination=pagination)
         elif stream == 'owners':
             return self.get_owners()
         elif stream == 'companies':
             return self.get_companies(since, pagination)
         elif stream == 'contact_lists':
             return self.get_contact_lists(since, pagination=pagination)
+        elif stream == 'list_memberships':
+            return self.get_list_memberships(parent_ids, pagination=pagination)
         elif stream == 'contacts_by_company':
             return self.get_contacts_by_company(parent_ids, pagination)
         elif stream == 'engagements':
@@ -332,7 +336,7 @@ class TestClient():
 
         return ",".join([record["name"] for record in records["results"]])
 
-    def get_contacts(self, pagination=False):
+    def get_contacts(self, pagination=False, archived=False):
         """
         Get all contacts.
         HubSpot API https://developers.hubspot.com/docs/api/crm/contacts
@@ -342,7 +346,7 @@ class TestClient():
         replication_key = list(self.replication_keys["contacts"])[0]
         records = []
 
-        params = {"limit": page_size, "associations": "tickets,company,deals", 'properties': self.get_contacts_properties()}
+        params = {"limit": page_size, "associations": "tickets,company,deals", 'properties': self.get_contacts_properties(), "archived": archived}
         while True:
             response = self.get(url, params=params)
 
@@ -355,10 +359,9 @@ class TestClient():
             if page_size and len(records) > page_size+10:
                 break
             params["after"] = response.get("paging").get("next").get("after")
-        
+
         records = self.denest_properties('contacts', records)
         return records
-
 
     def get_contacts_by_company(self, parent_ids, pagination=False):
         """
@@ -391,6 +394,52 @@ class TestClient():
                     break
 
             params = {'count': page_size}
+
+        return records
+
+    def get_list_memberships(self, parent_ids, pagination=False):
+        page_size = self.BaseTest.expected_metadata().get('list_memberships', {}).get(self.BaseTest.EXPECTED_PAGE_SIZE)
+        url = f"{BASE_URL}/crm/v3/lists/{{}}/memberships"
+        records = []
+
+        for parent_id in parent_ids:
+            params = {'count': page_size}
+            while True:
+                child_url = url.format(parent_id)
+                response = self.get(child_url, params=params)
+
+                for record in response.get("results", []):
+                    record['listId'] = parent_id
+                    records.append(record)
+
+                if not response.get("paging"):
+                    break
+                if pagination and len(records) > page_size+10:
+                    break
+                params["after"] = response.get("paging").get("next").get("after")
+
+        return records
+
+    def get_form_submissions(self, parent_ids, pagination=False):
+        page_size = self.BaseTest.expected_metadata().get('form_submissions', {}).get(self.BaseTest.EXPECTED_PAGE_SIZE)
+        url = f"{BASE_URL}/form-integrations/v1/submissions/forms/{{}}"
+        records = []
+
+        for parent_id in parent_ids:
+            params = {'count': page_size}
+            while True:
+                child_url = url.format(parent_id)
+                response = self.get(child_url, params=params)
+
+                for record in response.get("results", []):
+                    record['formId'] = parent_id
+                    records.append(record)
+
+                if not response.get("paging"):
+                    break
+                if pagination and len(records) > page_size+10:
+                    break
+                params["after"] = response.get("paging").get("next").get("after")
 
         return records
 
@@ -684,10 +733,10 @@ class TestClient():
             if page_size and len(records) > page_size+10:
                 break
             params["after"] = response.get("paging").get("next").get("after")
-        
+
         records = self.denest_properties('tickets', records)
         return records
-    
+
     def _get_custom_object_record_by_pk(self, object_name, id):
         """
         Get a specific custom object record by pk value
@@ -697,7 +746,7 @@ class TestClient():
         url = f"{BASE_URL}/crm/v3/objects/p_{object_name}/{id}?associations={associations}"
         response = self.get(url)
         return response
-    
+
     def get_custom_objects_properties(self, object_name, source_name):
         """
         Get custom object properties.
@@ -735,7 +784,7 @@ class TestClient():
             params['after'] = response.get("paging", {}).get('next', {}).get('after', None)
             if params['after'] is None:
                 break
-        
+
         records = self.denest_properties(stream, records)
         return records
 
@@ -743,7 +792,7 @@ class TestClient():
     ### CREATE
     ##########################################################################
 
-    def create(self, stream, company_ids=[], subscriptions=[], times=1):
+    def create(self, stream, company_ids=[], subscriptions=[], times=1, list_ids = []):
         """Dispatch create to make tests clean."""
 
         # Resets the access_token if the expiry time is less than or equal to the current time
@@ -758,6 +807,8 @@ class TestClient():
             return self.create_companies()
         elif stream == 'contact_lists':
             return self.create_contact_lists()
+        elif stream == 'list_memberships':
+            return self.create_list_memberships(list_ids)
         elif stream == 'static_contact_lists':
             staticlist = self.create_contact_lists(dynamic=False)
             return staticlist
@@ -821,7 +872,7 @@ class TestClient():
             "description": "A new number property for you",
             "groupName": "contactinformation",
             "type": "number",
-            "fieldType": "text",
+            "fieldType": "number",
             "formField": True,
             "displayOrder": 7,
             "options": [
@@ -835,7 +886,7 @@ class TestClient():
             "description": "A new date property for you",
             "groupName": "contactinformation",
             "type": "date",
-            "fieldType": "text",
+            "fieldType": "date",
             "formField": True,
             "displayOrder": 9,
             "options": [
@@ -849,7 +900,7 @@ class TestClient():
             "description": "A new datetime property for you",
             "groupName": "contactinformation",
             "type": "datetime",
-            "fieldType": "text",
+            "fieldType": "date",
             "formField": True,
             "displayOrder": 10,
             "options": [
@@ -953,6 +1004,21 @@ class TestClient():
         records = [response]
         return records
 
+    def create_list_memberships(self, list_ids):
+        records = []
+        for list_id in list_ids:
+            url = f"{BASE_URL}/crm/v3/lists/{list_id}/memberships/add"
+            data = ["462631815886", "462622843639"]
+            LOGGER.info("Post URL is %s", url)
+            try:
+                # generate a record
+                self.put(url, data)
+            except requests.exceptions.HTTPError as err:
+                LOGGER.debug("Update failed for %s", list_id)
+                continue
+            records.extend([{'listId': list_id, 'recordId': '462631815886'}, {'listId': list_id, 'recordId': '462622843639'}])
+        return records
+
     def create_contact_lists(self, dynamic=True):
         """
         HubSpot API https://developers.hubspot.com/docs/api-reference/crm-lists-v3/lists/post-crm-v3-lists-
@@ -964,31 +1030,39 @@ class TestClient():
         record_uuid = str(uuid.uuid4()).replace('-', '')
 
         url = f"{BASE_URL}/crm/v3/lists"
-        data = {
-            "name": f"tweeters{record_uuid}",
-            "objectTypeId": "0-1",
-            "processingType": "DYNAMIC",
-            "filterBranch": {
-            "filterBranchType": "OR",
-            "filterBranches": [
-                {
-                    "filterBranchType": "AND",
-                    "filters": [
+        if dynamic:
+            data = {
+                "name": f"tweeters{record_uuid}",
+                "objectTypeId": "0-1",
+                "processingType": "DYNAMIC",
+                "filterBranch": {
+                "filterBranchType": "OR",
+                "filterBranches": [
                     {
-                        "filterType": "PROPERTY",
-                        "operation": {
-                        "operationType": "NUMBER",
-                        "operator": "IS_GREATER_THAN_OR_EQUAL_TO",
-                        "value": 12
-                        },
-                        "property": "hs_predictivecontactscore_v2"
+                        "filterBranchType": "AND",
+                        "filters": [
+                        {
+                            "filterType": "PROPERTY",
+                            "operation": {
+                            "operationType": "NUMBER",
+                            "operator": "IS_GREATER_THAN_OR_EQUAL_TO",
+                            "value": 12
+                            },
+                            "property": "hs_predictivecontactscore_v2"
+                        }
+                        ]
                     }
-                    ]
-                }
-            ]
-        }
-            
-        }
+                ]
+            }
+
+            }
+        else:
+            data = {
+                "name": f"tweeters{record_uuid}",
+                "objectTypeId": "0-1",
+                "processingType": "MANUAL"
+            }
+
         # generate a record
         response = self.post(url, data)
         records = response["list"]
@@ -1145,8 +1219,15 @@ class TestClient():
         }
 
         # generate a record
-        response = self.post(url, data)
-        records = [response]
+        try:
+            response = self.post(url, data)
+            records = [response]
+        except requests.exceptions.HTTPError as err:
+            if 'pipelines limit' in err.response.text:
+                LOGGER.debug("Pipelines limit reached, skipping creation of new pipeline.")
+                records = []
+            else:
+                raise
         return records
 
     def create_deals(self):
@@ -1162,10 +1243,10 @@ class TestClient():
         data = {
             "associations": {
                 "associatedCompanyIds": [
-                    6804176293
+                    130787345085
                 ],
                 "associatedVids": [
-                    2304
+                    123338799847
                 ]
             },
             "properties": [
@@ -1182,7 +1263,7 @@ class TestClient():
                     "name": "pipeline"
                 },
                 {
-                    "value": "98621200",
+                    "value": "79930367",
                     "name": "hubspot_owner_id"
                 },
                 {
@@ -1257,22 +1338,17 @@ class TestClient():
         data = {
             "engagement": {
                 "active": True,
-                "ownerId": 98621200,
+                "ownerId": 79930367,
                 "type": "NOTE",
                 "timestamp": 1409172644778
             },
             "associations": {
                 "contactIds": [contact_id],
-                "companyIds": [6804176293],
+                "companyIds": [130787345085],
                 "dealIds": [],
                 "ownerIds": [],
                 "ticketIds": []
             },
-            "attachments": [
-                {
-                    "id": 4241968539
-                }
-            ],
             "metadata": {
                 "body": "note body"
             }
@@ -1774,7 +1850,7 @@ class TestClient():
         self.patch(url, data)
 
         return self._get_tickets_by_pk(ticket_id)
-    
+
     def update_custom_object_record(self, stream, id):
         """
         Updates a custom object record using the HubSpot CRM API.
@@ -1812,6 +1888,14 @@ class TestClient():
             self.delete_contact_lists(records, count)
         else:
             raise NotImplementedError(f"No delete method implemented for {stream}.")
+
+    def delete_contacts(self, record_ids=[]):
+        """
+        Delete a list of contact ids
+        """
+        for contactId in record_ids:
+            url = f"{BASE_URL}/crm/v3/objects/contacts/{contactId}"
+            self.delete(url)
 
     def delete_contact_lists(self, records=[], count=10):
         """
@@ -1871,13 +1955,12 @@ class TestClient():
         """
         payload = {
             "grant_type": "refresh_token",
-            "redirect_uri": self.CONFIG['redirect_uri'],
             "refresh_token": self.CONFIG['refresh_token'],
             "client_id": self.CONFIG['client_id'],
             "client_secret": self.CONFIG['client_secret'],
         }
 
-        response = requests.post(BASE_URL + "/oauth/v1/token", data=payload)
+        response = requests.post(BASE_URL + "/oauth/2026-03/token", data=payload)
         response.raise_for_status()
         auth = response.json()
         self.CONFIG['access_token'] = auth['access_token']
