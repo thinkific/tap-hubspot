@@ -928,7 +928,11 @@ def sync_email_events(STATE, ctx):
     STATE = sync_entity_chunked(STATE, catalog, "email_events", ["id"], "events")
     return STATE
 
-def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value):
+def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
+    # sync_start_time must be captured once by the parent (sync_contact_lists) before it
+    # snapshots the set of lists. Capturing it here per-list lets the bookmark advance
+    # past the creation time of lists missing from the parent's snapshot, permanently
+    # dropping their members on all subsequent syncs.
 
     mdata = metadata.to_map(catalog.get('metadata'))
     params = {
@@ -938,9 +942,6 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        # To handle records updated between start of the table sync and the end,
-        # store the current sync start in the state and not move the bookmark past this value.
-        sync_start_time = utils.now()
         for row in get_v3_records(url, params, "results", "paging"):
             record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
             record['listId'] = list_id
@@ -1018,7 +1019,7 @@ def sync_contact_lists(STATE, ctx):
                         max_bk_value = record[bookmark_key]
 
                     if "list_memberships" in ctx.selected_stream_ids:
-                        STATE, fs_max_bk_value = sync_list_memberships(row['listId'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value)
+                        STATE, fs_max_bk_value = sync_list_memberships(row['listId'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value, sync_start_time)
 
                 has_more = data.get('hasMore')
                 body["offset"] = data["offset"]
@@ -1038,7 +1039,9 @@ def sync_contact_lists(STATE, ctx):
 
     return STATE
 
-def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, max_bk_value):
+def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
+    # sync_start_time must be captured once by the parent (sync_forms) before it snapshots
+    # the set of forms — see sync_list_memberships for why capturing it per-form is unsafe.
 
     mdata = metadata.to_map(catalog.get('metadata'))
     url = get_url("form_submissions", form_id=form_id)
@@ -1048,9 +1051,6 @@ def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, 
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        # To handle records updated between start of the table sync and the end,
-        # store the current sync start in the state and not move the bookmark past this value.
-        sync_start_time = utils.now()
         for row in get_v3_records(url, params, "results", "paging"):
             record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
             record['formId'] = form_id
@@ -1090,13 +1090,15 @@ def sync_forms(STATE, ctx):
         fs_max_bk_value = fs_start
         LOGGER.info("sync form_submissions from %s", fs_start)
 
+    # To handle records updated between start of the table sync and the end,
+    # store the current sync start in the state and not move the bookmark past this value.
+    # Captured before the forms API snapshot so the form_submissions bookmark can never
+    # advance past the creation time of a form missing from this sync's snapshot.
+    sync_start_time = utils.now()
     data = request(get_url("forms")).json()
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        # To handle records updated between start of the table sync and the end,
-        # store the current sync start in the state and not move the bookmark past this value.
-        sync_start_time = utils.now()
         has_synced_data = False
         for row in data:
             has_synced_data = True
@@ -1108,7 +1110,7 @@ def sync_forms(STATE, ctx):
                 max_bk_value = record[bookmark_key]
 
             if "form_submissions" in ctx.selected_stream_ids:
-                STATE, fs_max_bk_value = sync_form_submissions(row['guid'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value)
+                STATE, fs_max_bk_value = sync_form_submissions(row['guid'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value, sync_start_time)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), sync_start_time)
