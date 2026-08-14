@@ -107,7 +107,7 @@ ENDPOINTS = {
     "tickets":              "/crm/v4/objects/tickets",
 
     "form_submissions":   "/form-integrations/v1/submissions/forms/{form_id}",
-    "list_memberships":   "/crm/v3/lists/{list_id}/memberships",
+    "list_memberships":   "/crm/v3/lists/{list_id}/memberships/join-order",
 
     "custom_objects_schema":        "/crm/v3/schemas",
     "custom_objects": "/crm/v3/objects/p_{object_name}"
@@ -928,21 +928,31 @@ def sync_email_events(STATE, ctx):
     STATE = sync_entity_chunked(STATE, catalog, "email_events", ["id"], "events")
     return STATE
 
-def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
-    # sync_start_time must be captured once by the parent (sync_contact_lists) before it
-    # snapshots the set of lists. Capturing it here per-list lets the bookmark advance
-    # past the creation time of lists missing from the parent's snapshot, permanently
-    # dropping their members on all subsequent syncs.
+# State key holding one join-order cursor per list id. The cursors bound how far
+# back the API scan starts; the membershipTimestamp bookmark alone decides what
+# gets emitted.
+LIST_MEMBERSHIPS_CURSOR_KEY = 'join_order_cursors'
 
-    mdata = metadata.to_map(catalog.get('metadata'))
-    params = {
-        'limit': 250
-    }
-    url = get_url("list_memberships", list_id=list_id)
-    time_extracted = utils.now()
+def scan_list_memberships(url, list_id, after, bumble_bee, schema, mdata, catalog,
+                          bookmark_key, start, max_bk_value, time_extracted):
+    """Page the join-order endpoint from `after` (from the beginning when None),
+    emitting records at or past `start`. Returns the running max bookmark value
+    and the most advanced cursor seen — None when the scan fit in a single page
+    without ever receiving one, in which case the caller has nothing to resume
+    from and the next sync rescans the list."""
+    latest_cursor = after
+    page_cursor = after
 
-    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        for row in get_v3_records(url, params, "results", "paging"):
+    while True:
+        params = {'limit': 250}
+        if page_cursor:
+            params['after'] = page_cursor
+        data = request(url, params).json()
+        if data.get('results') is None:
+            raise RuntimeError(
+                "Unexpected API response: results not in {}".format(data.keys()))
+
+        for row in data['results']:
             record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
             record['listId'] = list_id
 
@@ -950,6 +960,50 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
                 singer.write_record("list_memberships", record, catalog.get('stream_alias'), time_extracted=time_extracted)
             if record[bookmark_key] >= max_bk_value:
                 max_bk_value = record[bookmark_key]
+
+        page_cursor = (data.get('paging') or {}).get('next', {}).get('after')
+        if not page_cursor:
+            break
+        latest_cursor = page_cursor
+
+    return max_bk_value, latest_cursor
+
+def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
+    # sync_start_time must be captured once by the parent (sync_contact_lists) before it
+    # snapshots the set of lists. Capturing it here per-list lets the bookmark advance
+    # past the creation time of lists missing from the parent's snapshot, permanently
+    # dropping their members on all subsequent syncs.
+
+    mdata = metadata.to_map(catalog.get('metadata'))
+    url = get_url("list_memberships", list_id=list_id)
+    time_extracted = utils.now()
+
+    cursors = singer.get_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY) or {}
+    resume_cursor = cursors.get(list_id)
+
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
+        try:
+            max_bk_value, latest_cursor = scan_list_memberships(
+                url, list_id, resume_cursor, bumble_bee, schema, mdata, catalog,
+                bookmark_key, start, max_bk_value, time_extracted)
+        except requests.exceptions.HTTPError as err:
+            # HubSpot documents the after cursor as opaque; if a stored one is
+            # ever rejected, fall back to a full scan of this list rather than
+            # failing the sync. The membershipTimestamp filter keeps the rescan
+            # from re-emitting already-synced records.
+            if not resume_cursor or err.response is None or err.response.status_code != 400:
+                raise
+            LOGGER.warning(
+                "list_memberships: stored join-order cursor for list %s was rejected; "
+                "falling back to a full scan of the list", list_id)
+            cursors.pop(list_id, None)
+            max_bk_value, latest_cursor = scan_list_memberships(
+                url, list_id, None, bumble_bee, schema, mdata, catalog,
+                bookmark_key, start, max_bk_value, time_extracted)
+
+    if latest_cursor:
+        cursors[list_id] = latest_cursor
+    STATE = singer.write_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY, cursors)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), sync_start_time) if max_bk_value else sync_start_time

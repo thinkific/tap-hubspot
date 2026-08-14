@@ -159,14 +159,19 @@ class TestListMembershipsMidSyncListCreation(unittest.TestCase):
     """
 
     def run_contact_lists_sync(self, state, clock, list_pages, membership_pages):
+        """membership_pages: one single-page join-order API response body per
+        child list, in the order the lists are processed."""
         ctx = MockContext(["contact_lists", "list_memberships"])
         tap_hubspot.CONFIG['start_date'] = "2020-01-01T00:00:00Z"
 
+        membership_responses = [
+            MockResponse({"results": rows, "paging": {}}) for rows in membership_pages
+        ]
         with SingerWritePatches() as writes, \
                 patch('tap_hubspot.utils.now', side_effect=clock), \
                 patch('tap_hubspot.load_schema', side_effect=SCHEMAS.__getitem__), \
                 patch('tap_hubspot.post_search_endpoint', side_effect=[MockResponse(p) for p in list_pages]), \
-                patch('tap_hubspot.get_v3_records', side_effect=membership_pages):
+                patch('tap_hubspot.request', side_effect=membership_responses):
             state = sync_contact_lists(state, ctx)
 
         return state, writes
