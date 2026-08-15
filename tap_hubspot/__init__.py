@@ -930,43 +930,10 @@ def sync_email_events(STATE, ctx):
 
 # State key holding one join-order cursor per list id. The cursors bound how far
 # back the API scan starts; the membershipTimestamp bookmark alone decides what
-# gets emitted.
+# gets emitted. Entries for deleted lists are never pruned: they only cost a few
+# bytes each, while pruning against the parent's snapshot would drop cursors for
+# live lists outside its 10K-record search window.
 LIST_MEMBERSHIPS_CURSOR_KEY = 'join_order_cursors'
-
-def scan_list_memberships(url, list_id, after, bumble_bee, schema, mdata, catalog,
-                          bookmark_key, start, max_bk_value, time_extracted):
-    """Page the join-order endpoint from `after` (from the beginning when None),
-    emitting records at or past `start`. Returns the running max bookmark value
-    and the most advanced cursor seen — None when the scan fit in a single page
-    without ever receiving one, in which case the caller has nothing to resume
-    from and the next sync rescans the list."""
-    latest_cursor = after
-    page_cursor = after
-
-    while True:
-        params = {'limit': 250}
-        if page_cursor:
-            params['after'] = page_cursor
-        data = request(url, params).json()
-        if data.get('results') is None:
-            raise RuntimeError(
-                "Unexpected API response: results not in {}".format(data.keys()))
-
-        for row in data['results']:
-            record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
-            record['listId'] = list_id
-
-            if record[bookmark_key] >= start:
-                singer.write_record("list_memberships", record, catalog.get('stream_alias'), time_extracted=time_extracted)
-            if record[bookmark_key] >= max_bk_value:
-                max_bk_value = record[bookmark_key]
-
-        page_cursor = (data.get('paging') or {}).get('next', {}).get('after')
-        if not page_cursor:
-            break
-        latest_cursor = page_cursor
-
-    return max_bk_value, latest_cursor
 
 def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
     # sync_start_time must be captured once by the parent (sync_contact_lists) before it
@@ -979,27 +946,49 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
     time_extracted = utils.now()
 
     cursors = singer.get_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY) or {}
-    resume_cursor = cursors.get(list_id)
+    resume_cursor = cursors.pop(list_id, None)
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
+        def scan(after):
+            """Page the join-order endpoint from `after` (from the beginning when
+            None), emitting records at or past `start`. Returns the cursor that
+            fetched the final page — None when the scan fit in a single
+            uncursored page, in which case there is nothing to resume from and
+            the next sync rescans the list."""
+            nonlocal max_bk_value
+            params = {'limit': 250}
+            if after:
+                params['after'] = after
+            for row in get_v3_records(url, params, "results", "paging"):
+                record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+                record['listId'] = list_id
+
+                if record[bookmark_key] >= start:
+                    singer.write_record("list_memberships", record, catalog.get('stream_alias'), time_extracted=time_extracted)
+                if record[bookmark_key] >= max_bk_value:
+                    max_bk_value = record[bookmark_key]
+            # get_v3_records advances params['after'] in place as it pages, so once
+            # it is exhausted the dict holds the cursor of the final page fetched.
+            # The cursor tests run the real get_v3_records and fail if that
+            # contract ever changes.
+            return params.get('after')
+
         try:
-            max_bk_value, latest_cursor = scan_list_memberships(
-                url, list_id, resume_cursor, bumble_bee, schema, mdata, catalog,
-                bookmark_key, start, max_bk_value, time_extracted)
-        except requests.exceptions.HTTPError as err:
-            # HubSpot documents the after cursor as opaque; if a stored one is
-            # ever rejected, fall back to a full scan of this list rather than
-            # failing the sync. The membershipTimestamp filter keeps the rescan
-            # from re-emitting already-synced records.
-            if not resume_cursor or err.response is None or err.response.status_code != 400:
+            latest_cursor = scan(resume_cursor)
+        except Exception:  # pylint: disable=broad-except
+            # request() exhausts its retries and re-raises through on_giveup as a
+            # bare Exception, so the underlying HTTPError (e.g. a 400 rejecting a
+            # stale cursor) is not observable here. When a stored cursor was in
+            # play, rescan the list from the top before failing the sync — the
+            # membershipTimestamp filter keeps the rescan from re-emitting
+            # already-synced records, and a genuine outage fails the rescan too
+            # and propagates.
+            if not resume_cursor:
                 raise
             LOGGER.warning(
-                "list_memberships: stored join-order cursor for list %s was rejected; "
-                "falling back to a full scan of the list", list_id)
-            cursors.pop(list_id, None)
-            max_bk_value, latest_cursor = scan_list_memberships(
-                url, list_id, None, bumble_bee, schema, mdata, catalog,
-                bookmark_key, start, max_bk_value, time_extracted)
+                "list_memberships: resuming list %s from its stored join-order cursor "
+                "failed; falling back to a full scan of the list", list_id)
+            latest_cursor = scan(None)
 
     if latest_cursor:
         cursors[list_id] = latest_cursor

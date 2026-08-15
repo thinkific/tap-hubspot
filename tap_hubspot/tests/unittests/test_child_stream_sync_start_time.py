@@ -113,24 +113,20 @@ class AdvancingClock:
 
 
 class SingerWritePatches:
-    """Route write_bookmark into real state handling, capture write_record calls,
-    and silence schema/state output."""
+    """Capture write_record calls and silence schema/state output."""
 
     def __init__(self):
         self.written = []
 
     def __enter__(self):
-        self.originals = (singer.write_record, singer.write_schema,
-                          singer.write_state, singer.write_bookmark)
+        self.originals = (singer.write_record, singer.write_schema, singer.write_state)
         singer.write_record = lambda stream, record, *a, **kw: self.written.append((stream, record))
         singer.write_schema = MagicMock()
         singer.write_state = MagicMock()
-        singer.write_bookmark = lambda state, stream, key, val: singer.bookmarks.write_bookmark(state, stream, key, val)
         return self
 
     def __exit__(self, *exc):
-        (singer.write_record, singer.write_schema,
-         singer.write_state, singer.write_bookmark) = self.originals
+        (singer.write_record, singer.write_schema, singer.write_state) = self.originals
         return False
 
     def records_for(self, stream):
@@ -261,7 +257,8 @@ class TestChildStreamsReceiveParentSyncStartTime(unittest.TestCase):
             "hasMore": False,
             "offset": 0,
         })
-        mock_sync_memberships.side_effect = lambda *args: (args[1], args[6])
+        mock_sync_memberships.side_effect = \
+            lambda list_id, state, schema, catalog, bk_key, start, max_bk, sync_start: (state, max_bk)
 
         state = {
             "currently_syncing": "contact_lists",
@@ -277,7 +274,7 @@ class TestChildStreamsReceiveParentSyncStartTime(unittest.TestCase):
             sync_contact_lists(state, ctx)
 
         self.assertEqual(mock_sync_memberships.call_count, 2)
-        passed_start_times = {call[0][7] for call in mock_sync_memberships.call_args_list}
+        passed_start_times = {call.args[-1] for call in mock_sync_memberships.call_args_list}
         self.assertEqual(
             passed_start_times, {SYNC_1_START},
             "every sync_list_memberships call must receive the sync's single start time")
@@ -292,7 +289,8 @@ class TestChildStreamsReceiveParentSyncStartTime(unittest.TestCase):
             {"guid": "f1", "updatedAt": "2024-05-01T00:00:00Z"},
             {"guid": "f2", "updatedAt": "2024-04-01T00:00:00Z"},
         ])
-        mock_sync_submissions.side_effect = lambda *args: (args[1], args[6])
+        mock_sync_submissions.side_effect = \
+            lambda form_id, state, schema, catalog, bk_key, start, max_bk, sync_start: (state, max_bk)
 
         state = {
             "currently_syncing": "forms",
@@ -308,7 +306,7 @@ class TestChildStreamsReceiveParentSyncStartTime(unittest.TestCase):
             sync_forms(state, ctx)
 
         self.assertEqual(mock_sync_submissions.call_count, 2)
-        passed_start_times = {call[0][7] for call in mock_sync_submissions.call_args_list}
+        passed_start_times = {call.args[-1] for call in mock_sync_submissions.call_args_list}
         # SYNC_1_START is the clock's first tick: the capture must precede the
         # forms API request, so a form created between request and capture can't
         # poison the form_submissions bookmark.

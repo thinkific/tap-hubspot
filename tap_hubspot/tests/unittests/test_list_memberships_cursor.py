@@ -1,8 +1,7 @@
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from datetime import datetime, timezone
 
-import requests
 import singer
 import tap_hubspot
 from tap_hubspot import sync_list_memberships, LIST_MEMBERSHIPS_CURSOR_KEY
@@ -27,8 +26,6 @@ def page(rows, next_after=None):
     body = {"results": rows}
     if next_after:
         body["paging"] = {"next": {"after": next_after}}
-    else:
-        body["paging"] = {}
     return MockResponse(body)
 
 
@@ -47,14 +44,27 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
     """
 
     def run_sync(self, state, responses, list_id="L1", start=OLD_BOOKMARK):
+        """Returns (state, writes, requested_params) where requested_params is a
+        snapshot of the params dict at each request — get_v3_records mutates the
+        dict in place between pages, so the live call_args can't be asserted on."""
         catalog = CATALOGS["list_memberships"]
+        response_iter = iter(responses)
+        requested_params = []
+
+        def fake_request(url, params=None):
+            requested_params.append(dict(params or {}))
+            response = next(response_iter)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
         with SingerWritePatches() as writes, \
                 patch('tap_hubspot.utils.now', return_value=SYNC_START), \
-                patch('tap_hubspot.request', side_effect=responses) as mock_request:
-            state, max_bk = sync_list_memberships(
+                patch('tap_hubspot.request', side_effect=fake_request):
+            state, _ = sync_list_memberships(
                 list_id, state, LIST_MEMBERSHIPS_SCHEMA, catalog,
                 'membershipTimestamp', start, start, SYNC_START)
-        return state, writes, mock_request
+        return state, writes, requested_params
 
     def saved_cursors(self, state):
         return singer.bookmarks.get_bookmark(
@@ -66,11 +76,11 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
                   member("r2", "2024-03-01T00:00:00Z")], next_after="CURSOR-1"),
             page([member("r3", "2024-04-01T00:00:00Z")]),
         ]
-        state, writes, mock_request = self.run_sync(state_with(), responses)
+        state, writes, requested = self.run_sync(state_with(), responses)
 
         # No `after` on the first request; the saved next.after on the second.
-        self.assertNotIn("after", mock_request.call_args_list[0][0][1])
-        self.assertEqual(mock_request.call_args_list[1][0][1]["after"], "CURSOR-1")
+        self.assertNotIn("after", requested[0])
+        self.assertEqual(requested[1]["after"], "CURSOR-1")
 
         written = [r["recordId"] for r in writes.records_for("list_memberships")]
         self.assertEqual(written, ["r1", "r2", "r3"])
@@ -83,10 +93,10 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
             page([member("r4", "2024-05-01T00:00:00Z")], next_after="CURSOR-2"),
             page([]),
         ]
-        state, writes, mock_request = self.run_sync(
+        state, writes, requested = self.run_sync(
             state_with(cursors={"L1": "CURSOR-1"}), responses)
 
-        self.assertEqual(mock_request.call_args_list[0][0][1]["after"], "CURSOR-1")
+        self.assertEqual(requested[0]["after"], "CURSOR-1")
         written = [r["recordId"] for r in writes.records_for("list_memberships")]
         self.assertEqual(written, ["r4"])
         self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-2"})
@@ -115,39 +125,45 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         # Cursor is retained even when the resumed scan returned no new one.
         self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-1"})
 
-    def test_rejected_cursor_falls_back_to_full_scan(self):
-        stale_error = requests.exceptions.HTTPError(
-            response=MagicMock(status_code=400))
+    def test_failed_cursor_resume_falls_back_to_full_scan(self):
+        # request() surfaces exhausted retries as a bare Exception (on_giveup),
+        # which is what a stale/rejected cursor looks like from the sync's side.
+        giveup = Exception("Giving up on request after 5 tries")
         responses = [
-            stale_error,
+            giveup,
             page([member("r1", "2024-02-01T00:00:00Z")], next_after="CURSOR-9"),
             page([]),
         ]
-        state, writes, mock_request = self.run_sync(
+        state, writes, requested = self.run_sync(
             state_with(cursors={"L1": "STALE"}), responses)
 
         # First call used the stale cursor, the fallback rescanned from the top.
-        self.assertEqual(mock_request.call_args_list[0][0][1]["after"], "STALE")
-        self.assertNotIn("after", mock_request.call_args_list[1][0][1])
+        self.assertEqual(requested[0]["after"], "STALE")
+        self.assertNotIn("after", requested[1])
 
         written = [r["recordId"] for r in writes.records_for("list_memberships")]
         self.assertEqual(written, ["r1"])
         self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-9"})
 
-    def test_non_cursor_http_errors_propagate(self):
-        server_error = requests.exceptions.HTTPError(
-            response=MagicMock(status_code=500))
-        with self.assertRaises(requests.exceptions.HTTPError):
-            self.run_sync(state_with(cursors={"L1": "C"}), [server_error])
+    def test_errors_without_stored_cursor_propagate(self):
+        with self.assertRaises(Exception):
+            self.run_sync(state_with(), [Exception("Giving up on request")])
+
+    def test_error_in_fallback_scan_propagates(self):
+        # A genuine outage fails the resumed scan AND the fallback rescan; the
+        # second failure must propagate rather than loop.
+        responses = [Exception("Giving up on request"), Exception("Giving up on request")]
+        with self.assertRaises(Exception):
+            self.run_sync(state_with(cursors={"L1": "C"}), responses)
 
     def test_cursors_tracked_independently_per_list(self):
         state = state_with(cursors={"L1": "CURSOR-1"})
         responses = [page([member("x1", "2024-05-01T00:00:00Z")], next_after="CURSOR-L2"),
                      page([])]
-        state, _, mock_request = self.run_sync(state, responses, list_id="L2")
+        state, _, requested = self.run_sync(state, responses, list_id="L2")
 
         # L2 had no cursor: full scan, no `after` on its first request.
-        self.assertNotIn("after", mock_request.call_args_list[0][0][1])
+        self.assertNotIn("after", requested[0])
         self.assertEqual(self.saved_cursors(state),
                          {"L1": "CURSOR-1", "L2": "CURSOR-L2"})
 
