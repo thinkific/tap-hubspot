@@ -1,8 +1,37 @@
 # Changelog
 
+## 4.5.0
+  * Migrate engagements sync from `/paged` to `/engagements/v1/engagements/modified/after` with opaque cursor-based pagination for incremental, crash-safe resume.
+
+## 4.4.0
+  * Upgrade OAuth v1 API to the latest date-based versioned API  [#306](https://github.com/singer-io/tap-hubspot/pull/306)
+
+## 4.3.2
+  * Sync contact_lists in sorted order. [#304](https://github.com/singer-io/tap-hubspot/pull/304)
+
+## 4.3.1
+  * Bump requests to 2.33.0 for security updates [#303](https://github.com/singer-io/tap-hubspot/pull/303)
+
+## 4.3.0
+  * Always write bookmarks for form_submissions and list_memberships streams, even when there are no records. [#292](https://github.com/singer-io/tap-hubspot/pull/292)
+
+## 4.2.0
+  * Refactor parent-stream metadata for contacts_by_company, form_submissions, and list_memberships [#290](https://github.com/singer-io/tap-hubspot/pull/290) 
+
+## 4.1.0
+  * Add new streams [#284](https://github.com/singer-io/tap-hubspot/pull/284)
+    * [form_submissions](https://developers.hubspot.com/docs/api-reference/legacy/forms-v1/submissions/get-form-integrations-v1-submissions-forms-form_guid)
+    * [list_memberships](https://developers.hubspot.com/docs/api-reference/crm-lists-v3/memberships/get-crm-v3-lists-listId-memberships)
+
+## 4.0.2
+  * Retry the API requests for all the errors [#282](https://github.com/singer-io/tap-hubspot/pull/282)
+
+## 4.0.1
+  * Updates all non-primary key fields to be nullable [#281](https://github.com/singer-io/tap-hubspot/pull/281)
+
 ## 4.0.0
   * Upgrade API version v1 to v3 for [contacts](https://developers.hubspot.com/docs/api-reference/crm-contacts-v3/basic/get-crm-v3-objects-contacts) and [contact_lists](https://developers.hubspot.com/docs/api-reference/crm-lists-v3/lists/post-crm-v3-lists-search) stream.
-  * Update primary_key to `id` and replication_key to `updatedAt` for `contacts`
+  * Update primary_key to `id` and replication_key to `updatedAt` for `contacts` [#277](https://github.com/singer-io/tap-hubspot/pull/277)
 
 ## 3.3.0
   * Add support for personal access tokens (api_key) instead of passing oauth creds [#276](https://github.com/singer-io/tap-hubspot/pull/276)

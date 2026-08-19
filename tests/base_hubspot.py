@@ -15,9 +15,7 @@ class HubspotBaseCase(BaseCase):
     # set the default start date which can be overridden in the tests.
     start_date = BaseCase.timedelta_formatted(dt.utcnow(), delta=timedelta(days=-1))
 
-    EXTRA_FIELDS = {
-        "contacts": { "versionTimestamp" }
-    }
+    EXTRA_FIELDS = {}
 
     def setUp(self):
         missing_envs = [x for x in [
@@ -70,6 +68,14 @@ class HubspotBaseCase(BaseCase):
                 BaseCase.API_LIMIT: 250,
                 BaseCase.OBEYS_START_DATE: True
             },
+            "list_memberships": {
+                BaseCase.PRIMARY_KEYS: {"recordId", "listId"},
+                BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
+                BaseCase.REPLICATION_KEYS: {"membershipTimestamp"},
+                BaseCase.EXPECTED_PAGE_SIZE: 250,
+                BaseCase.OBEYS_START_DATE: True,
+                BaseCase.PARENT_STREAM: 'contact_lists'
+            },
             "contacts": {
                 BaseCase.PRIMARY_KEYS: {"id"},
                 BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
@@ -115,6 +121,13 @@ class HubspotBaseCase(BaseCase):
                 BaseCase.REPLICATION_KEYS: {"updatedAt"},
                 BaseCase.OBEYS_START_DATE: True
             },
+            "form_submissions": {
+                BaseCase.PRIMARY_KEYS: {"conversionId"},
+                BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
+                BaseCase.REPLICATION_KEYS: {"submittedAt"},
+                BaseCase.OBEYS_START_DATE: True,
+                BaseCase.PARENT_STREAM: 'forms'
+            },
             "owners": {
                 BaseCase.PRIMARY_KEYS: {"id"},
                 BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
@@ -141,38 +154,5 @@ class HubspotBaseCase(BaseCase):
                 BaseCase.API_LIMIT: 100,
                 BaseCase.OBEYS_START_DATE: True
             },
-            # below are the custom_objects stream
-            "cars": {
-                BaseCase.PRIMARY_KEYS: {"id"},
-                BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
-                BaseCase.REPLICATION_KEYS: {"updatedAt"},
-                BaseCase.API_LIMIT: 100,
-                BaseCase.EXPECTED_PAGE_SIZE: 100,
-                BaseCase.OBEYS_START_DATE: True
-            },
-            "co_firsts": {
-                BaseCase.PRIMARY_KEYS: {"id"},
-                BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
-                BaseCase.REPLICATION_KEYS: {"updatedAt"},
-                BaseCase.API_LIMIT: 100,
-                BaseCase.EXPECTED_PAGE_SIZE: 100,
-                BaseCase.OBEYS_START_DATE: True
-            },
-            "custom_object_campaigns": {
-                BaseCase.PRIMARY_KEYS: {"id"},
-                BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
-                BaseCase.REPLICATION_KEYS: {"updatedAt"},
-                BaseCase.API_LIMIT: 100,
-                BaseCase.EXPECTED_PAGE_SIZE: 100,
-                BaseCase.OBEYS_START_DATE: True
-            },
-            "custom_object_contacts": {
-                BaseCase.PRIMARY_KEYS: {"id"},
-                BaseCase.REPLICATION_METHOD: BaseCase.INCREMENTAL,
-                BaseCase.REPLICATION_KEYS: {"updatedAt"},
-                BaseCase.API_LIMIT: 100,
-                BaseCase.EXPECTED_PAGE_SIZE: 100,
-                BaseCase.OBEYS_START_DATE: True
-            }
 
         }

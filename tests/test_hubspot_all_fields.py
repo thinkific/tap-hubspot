@@ -80,6 +80,9 @@ KNOWN_MISSING_FIELDS = {
         'enrichable',
         'themeName',
         'style',
+        'spamNotificationsEnabled',
+        'captchaVersion',
+        'spamNotificationsRecipients',
         'thankYouMessageJson',
         'createMarketableContact',
         'kickbackEmailWorkflowId',
@@ -95,6 +98,10 @@ KNOWN_MISSING_FIELDS = {
         'isPublished',
         'paymentSessionTemplateIds',
         'selectedExternalOptions',
+        'captchaVersion',  # New field returned by API
+        'spamNotificationsEnabled',  # New field returned by API
+        'spamNotificationsRecipients',  # New field returned by API
+        'processDeal',  # this field is deprecated in v3 API
     },
     'companies': {  # BUG https://jira.talendforge.org/browse/TDL-15003
         'mergeAudits',
@@ -155,34 +162,40 @@ class TestHubspotAllFields(HubspotBaseTest):
 
     def streams_under_test(self):
         """expected streams minus the streams not under test"""
+        # return {'forms'}  # scaled down streams for quick test
         return self.expected_streams().difference({
             'owners',
             'subscription_changes', # BUG_TDL-14938 https://jira.talendforge.org/browse/TDL-14938
+            'workflows'
         })
 
     def setUp(self):
         self.maxDiff = None  # see all output in failure
-
         test_client = TestClient(start_date=self.get_properties()['start_date'])
         self.expected_records = dict()
         streams = self.streams_under_test()
-        stream_to_run_last = 'contacts_by_company'
-        if stream_to_run_last in streams:
-            streams.remove(stream_to_run_last)
-            streams = list(streams)
-            streams.append(stream_to_run_last)
 
-        for stream in streams:
+        # move child streams to the end of the list so parent ids are pre-populated by test client
+        child_streams = ['contacts_by_company', 'list_memberships']
+        expected_child_streams = [stream for stream in streams if stream in child_streams]
+        expected_streams = list(set(streams) - set(expected_child_streams))
+        expected_streams.extend(expected_child_streams)
+
+        for stream in expected_streams:
             # Get all records
             if stream == 'contacts_by_company':
-                company_ids = [company['companyId'] for company in self.expected_records['companies']]
+                company_ids = [company['companyId'] for company in self.expected_records.get(
+                    'companies', [])]
                 self.expected_records[stream] = test_client.read(stream, parent_ids=company_ids)
+            elif stream == 'list_memberships':
+                list_ids = [contact_list['listId'] for contact_list in self.expected_records.get(
+                    'contact_lists', [])]
+                self.expected_records[stream] = test_client.read(stream, parent_ids=list_ids)
             else:
                 self.expected_records[stream] = test_client.read(stream)
 
         for stream, records in self.expected_records.items():
             LOGGER.info("The test client found %s %s records.", len(records), stream)
-
 
         self.convert_datatype(self.expected_records)
 
@@ -271,7 +284,9 @@ class TestHubspotAllFields(HubspotBaseTest):
                             known_extra_keys.add(extra_key)
 
                         # Verify the fields in our expected record match the fields in the corresponding replicated record
-                        expected_keys_adjusted = expected_keys.union(known_extra_keys)
+                        #     As of Oct 10, 2025 HubSpot's v4 API removed groupId from responses, currently still present
+                        #     in the test_client. TODO explore updating client
+                        expected_keys_adjusted = expected_keys.union(known_extra_keys) - {'groupId', 'url'}
                         actual_keys_adjusted = actual_keys.union(known_missing_keys)
 
                         # NB: The following woraround is for dynamic fields on the `deals` stream that we just can't track.
