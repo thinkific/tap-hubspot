@@ -107,7 +107,7 @@ ENDPOINTS = {
     "tickets":              "/crm/v4/objects/tickets",
 
     "form_submissions":   "/form-integrations/v1/submissions/forms/{form_id}",
-    "list_memberships":   "/crm/v3/lists/{list_id}/memberships",
+    "list_memberships":   "/crm/v3/lists/{list_id}/memberships/join-order",
 
     "custom_objects_schema":        "/crm/v3/schemas",
     "custom_objects": "/crm/v3/objects/p_{object_name}"
@@ -928,27 +928,71 @@ def sync_email_events(STATE, ctx):
     STATE = sync_entity_chunked(STATE, catalog, "email_events", ["id"], "events")
     return STATE
 
-def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value):
+# State key holding one join-order cursor per list id. The cursors bound how far
+# back the API scan starts; the membershipTimestamp bookmark alone decides what
+# gets emitted. Entries for deleted lists are never pruned: they only cost a few
+# bytes each, while pruning against the parent's snapshot would drop cursors for
+# live lists outside its 10K-record search window.
+LIST_MEMBERSHIPS_CURSOR_KEY = 'join_order_cursors'
+
+def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
+    # sync_start_time must be captured once by the parent (sync_contact_lists) before it
+    # snapshots the set of lists. Capturing it here per-list lets the bookmark advance
+    # past the creation time of lists missing from the parent's snapshot, permanently
+    # dropping their members on all subsequent syncs.
 
     mdata = metadata.to_map(catalog.get('metadata'))
-    params = {
-        'limit': 250
-    }
     url = get_url("list_memberships", list_id=list_id)
     time_extracted = utils.now()
 
-    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        # To handle records updated between start of the table sync and the end,
-        # store the current sync start in the state and not move the bookmark past this value.
-        sync_start_time = utils.now()
-        for row in get_v3_records(url, params, "results", "paging"):
-            record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
-            record['listId'] = list_id
+    cursors = singer.get_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY) or {}
+    resume_cursor = cursors.pop(list_id, None)
 
-            if record[bookmark_key] >= start:
-                singer.write_record("list_memberships", record, catalog.get('stream_alias'), time_extracted=time_extracted)
-            if record[bookmark_key] >= max_bk_value:
-                max_bk_value = record[bookmark_key]
+    with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
+        def scan(after):
+            """Page the join-order endpoint from `after` (from the beginning when
+            None), emitting records at or past `start`. Returns the cursor that
+            fetched the final page — None when the scan fit in a single
+            uncursored page, in which case there is nothing to resume from and
+            the next sync rescans the list."""
+            nonlocal max_bk_value
+            params = {'limit': 250}
+            if after:
+                params['after'] = after
+            for row in get_v3_records(url, params, "results", "paging"):
+                record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
+                record['listId'] = list_id
+
+                if record[bookmark_key] >= start:
+                    singer.write_record("list_memberships", record, catalog.get('stream_alias'), time_extracted=time_extracted)
+                if record[bookmark_key] >= max_bk_value:
+                    max_bk_value = record[bookmark_key]
+            # get_v3_records advances params['after'] in place as it pages, so once
+            # it is exhausted the dict holds the cursor of the final page fetched.
+            # The cursor tests run the real get_v3_records and fail if that
+            # contract ever changes.
+            return params.get('after')
+
+        try:
+            latest_cursor = scan(resume_cursor)
+        except Exception:  # pylint: disable=broad-except
+            # request() exhausts its retries and re-raises through on_giveup as a
+            # bare Exception, so the underlying HTTPError (e.g. a 400 rejecting a
+            # stale cursor) is not observable here. When a stored cursor was in
+            # play, rescan the list from the top before failing the sync — the
+            # membershipTimestamp filter keeps the rescan from re-emitting
+            # already-synced records, and a genuine outage fails the rescan too
+            # and propagates.
+            if not resume_cursor:
+                raise
+            LOGGER.warning(
+                "list_memberships: resuming list %s from its stored join-order cursor "
+                "failed; falling back to a full scan of the list", list_id)
+            latest_cursor = scan(None)
+
+    if latest_cursor:
+        cursors[list_id] = latest_cursor
+    STATE = singer.write_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY, cursors)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), sync_start_time) if max_bk_value else sync_start_time
@@ -1018,7 +1062,7 @@ def sync_contact_lists(STATE, ctx):
                         max_bk_value = record[bookmark_key]
 
                     if "list_memberships" in ctx.selected_stream_ids:
-                        STATE, fs_max_bk_value = sync_list_memberships(row['listId'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value)
+                        STATE, fs_max_bk_value = sync_list_memberships(row['listId'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value, sync_start_time)
 
                 has_more = data.get('hasMore')
                 body["offset"] = data["offset"]
@@ -1038,7 +1082,9 @@ def sync_contact_lists(STATE, ctx):
 
     return STATE
 
-def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, max_bk_value):
+def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
+    # sync_start_time must be captured once by the parent (sync_forms) before it snapshots
+    # the set of forms — see sync_list_memberships for why capturing it per-form is unsafe.
 
     mdata = metadata.to_map(catalog.get('metadata'))
     url = get_url("form_submissions", form_id=form_id)
@@ -1048,9 +1094,6 @@ def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, 
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        # To handle records updated between start of the table sync and the end,
-        # store the current sync start in the state and not move the bookmark past this value.
-        sync_start_time = utils.now()
         for row in get_v3_records(url, params, "results", "paging"):
             record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
             record['formId'] = form_id
@@ -1090,13 +1133,15 @@ def sync_forms(STATE, ctx):
         fs_max_bk_value = fs_start
         LOGGER.info("sync form_submissions from %s", fs_start)
 
+    # To handle records updated between start of the table sync and the end,
+    # store the current sync start in the state and not move the bookmark past this value.
+    # Captured before the forms API snapshot so the form_submissions bookmark can never
+    # advance past the creation time of a form missing from this sync's snapshot.
+    sync_start_time = utils.now()
     data = request(get_url("forms")).json()
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        # To handle records updated between start of the table sync and the end,
-        # store the current sync start in the state and not move the bookmark past this value.
-        sync_start_time = utils.now()
         has_synced_data = False
         for row in data:
             has_synced_data = True
@@ -1108,7 +1153,7 @@ def sync_forms(STATE, ctx):
                 max_bk_value = record[bookmark_key]
 
             if "form_submissions" in ctx.selected_stream_ids:
-                STATE, fs_max_bk_value = sync_form_submissions(row['guid'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value)
+                STATE, fs_max_bk_value = sync_form_submissions(row['guid'], STATE, fs_schema, fs_catalog, fs_bookmark_key, fs_start, fs_max_bk_value, sync_start_time)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), sync_start_time)
