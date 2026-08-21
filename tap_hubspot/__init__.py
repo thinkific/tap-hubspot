@@ -1116,6 +1116,16 @@ def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, 
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
+        # The v1 submissions endpoint returns newest-first (verified empirically —
+        # AE-404; HubSpot does not document the ordering), so once a record falls
+        # below `start` every remaining record does too and pagination can stop,
+        # making incremental syncs O(new submissions) instead of O(all history).
+        # Because the ordering is undocumented, guard it: exit early only after a
+        # strictly descending step has been observed with no ascending step;
+        # otherwise warn and degrade to the full client-filtered scan.
+        prev_bk_value = None
+        saw_descending = False
+        order_ok = True
         for row in get_v3_records(url, params, "results", "paging"):
             record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
             record['formId'] = form_id
@@ -1124,6 +1134,20 @@ def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, 
                 singer.write_record("form_submissions", record, catalog.get('stream_alias'), time_extracted=time_extracted)
             if record[bookmark_key] >= max_bk_value:
                 max_bk_value = record[bookmark_key]
+
+            if prev_bk_value is not None:
+                if record[bookmark_key] > prev_bk_value:
+                    if order_ok:
+                        LOGGER.warning(
+                            "form_submissions: form %s returned submissions out of descending "
+                            "order; disabling early exit and scanning fully", form_id)
+                    order_ok = False
+                elif record[bookmark_key] < prev_bk_value:
+                    saw_descending = True
+            prev_bk_value = record[bookmark_key]
+
+            if order_ok and saw_descending and record[bookmark_key] < start:
+                break
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), sync_start_time) if max_bk_value else sync_start_time
