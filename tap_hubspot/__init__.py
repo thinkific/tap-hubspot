@@ -963,7 +963,14 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
                 record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
                 record['listId'] = list_id
 
-                if record[bookmark_key] >= start:
+                # A cursor-resumed scan returns only members joined after the
+                # saved position, so every record is new even when the shared
+                # bookmark has run ahead of this list (e.g. an interrupted sync
+                # advanced it before this list's turn). Emit unconditionally —
+                # the target upserts on (recordId, listId), so the occasional
+                # refetched tail page is idempotent. The bookmark filter only
+                # gates full scans, where it prevents re-emitting whole lists.
+                if after or record[bookmark_key] >= start:
                     singer.write_record("list_memberships", record, catalog.get('stream_alias'), time_extracted=time_extracted)
                 if record[bookmark_key] >= max_bk_value:
                     max_bk_value = record[bookmark_key]
@@ -1045,7 +1052,11 @@ def sync_contact_lists(STATE, ctx):
 
     # To handle records updated between start of the table sync and the end,
     # store the current sync start in the state and not move the bookmark past this value.
-    sync_start_time = utils.now()
+    # Persisted (same pattern as sync_companies) so restarts of an interrupted run keep
+    # the original bound instead of re-capturing a later one, which would let the
+    # bookmark ratchet past lists the interrupted runs never reached.
+    sync_start_time = get_current_sync_start(STATE, "contact_lists") or utils.now()
+    STATE = write_current_sync_start(STATE, "contact_lists", sync_start_time)
 
     for _option in sort_options:
         body = {'count': 250, 'sort': _option}
@@ -1078,6 +1089,7 @@ def sync_contact_lists(STATE, ctx):
     if not has_synced_data and "list_memberships" in ctx.selected_stream_ids:
         STATE = singer.write_bookmark(STATE, 'list_memberships', fs_bookmark_key, utils.strftime(new_bookmark))
     STATE = singer.write_bookmark(STATE, 'contact_lists', bookmark_key, utils.strftime(new_bookmark))
+    STATE = write_current_sync_start(STATE, "contact_lists", None)
     singer.write_state(STATE)
 
     return STATE
@@ -1136,8 +1148,11 @@ def sync_forms(STATE, ctx):
     # To handle records updated between start of the table sync and the end,
     # store the current sync start in the state and not move the bookmark past this value.
     # Captured before the forms API snapshot so the form_submissions bookmark can never
-    # advance past the creation time of a form missing from this sync's snapshot.
-    sync_start_time = utils.now()
+    # advance past the creation time of a form missing from this sync's snapshot, and
+    # persisted (same pattern as sync_companies) so restarts of an interrupted run keep
+    # the original bound.
+    sync_start_time = get_current_sync_start(STATE, "forms") or utils.now()
+    STATE = write_current_sync_start(STATE, "forms", sync_start_time)
     data = request(get_url("forms")).json()
     time_extracted = utils.now()
 
@@ -1161,6 +1176,7 @@ def sync_forms(STATE, ctx):
     if not has_synced_data and "form_submissions" in ctx.selected_stream_ids:
         STATE = singer.write_bookmark(STATE, 'form_submissions', fs_bookmark_key, utils.strftime(new_bookmark))
     STATE = singer.write_bookmark(STATE, 'forms', bookmark_key, utils.strftime(new_bookmark))
+    STATE = write_current_sync_start(STATE, "forms", None)
     singer.write_state(STATE)
 
     return STATE

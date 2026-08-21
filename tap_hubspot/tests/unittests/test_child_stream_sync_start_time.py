@@ -145,6 +145,25 @@ MID_SYNC_MEMBERSHIP_TS = "2024-06-01T00:25:00.000000Z"
 LIST_CREATED_MID_SYNC_TS = "2024-06-01T00:05:00.000000Z"
 
 
+def run_contact_lists_sync(state, clock, list_pages, membership_pages):
+    """membership_pages: one single-page join-order API response body per
+    child list, in the order the lists are processed."""
+    ctx = MockContext(["contact_lists", "list_memberships"])
+    tap_hubspot.CONFIG['start_date'] = "2020-01-01T00:00:00Z"
+
+    membership_responses = [
+        MockResponse({"results": rows, "paging": {}}) for rows in membership_pages
+    ]
+    with SingerWritePatches() as writes, \
+            patch('tap_hubspot.utils.now', side_effect=clock), \
+            patch('tap_hubspot.load_schema', side_effect=SCHEMAS.__getitem__), \
+            patch('tap_hubspot.post_search_endpoint', side_effect=[MockResponse(p) for p in list_pages]), \
+            patch('tap_hubspot.request', side_effect=membership_responses):
+        state = sync_contact_lists(state, ctx)
+
+    return state, writes
+
+
 class TestListMembershipsMidSyncListCreation(unittest.TestCase):
     """
     Regression tests for AE-320: the list_memberships bookmark must never advance
@@ -153,24 +172,6 @@ class TestListMembershipsMidSyncListCreation(unittest.TestCase):
     forward in wall-clock time, permanently dropping members of any list created
     mid-sync.
     """
-
-    def run_contact_lists_sync(self, state, clock, list_pages, membership_pages):
-        """membership_pages: one single-page join-order API response body per
-        child list, in the order the lists are processed."""
-        ctx = MockContext(["contact_lists", "list_memberships"])
-        tap_hubspot.CONFIG['start_date'] = "2020-01-01T00:00:00Z"
-
-        membership_responses = [
-            MockResponse({"results": rows, "paging": {}}) for rows in membership_pages
-        ]
-        with SingerWritePatches() as writes, \
-                patch('tap_hubspot.utils.now', side_effect=clock), \
-                patch('tap_hubspot.load_schema', side_effect=SCHEMAS.__getitem__), \
-                patch('tap_hubspot.post_search_endpoint', side_effect=[MockResponse(p) for p in list_pages]), \
-                patch('tap_hubspot.request', side_effect=membership_responses):
-            state = sync_contact_lists(state, ctx)
-
-        return state, writes
 
     @staticmethod
     def initial_state():
@@ -193,7 +194,7 @@ class TestListMembershipsMidSyncListCreation(unittest.TestCase):
         membership_pages = [
             [{"recordId": "a1", "membershipTimestamp": MID_SYNC_MEMBERSHIP_TS}],
         ]
-        return self.run_contact_lists_sync(
+        return run_contact_lists_sync(
             self.initial_state(), AdvancingClock(SYNC_1_START), list_pages, membership_pages)
 
     def test_bookmark_not_advanced_past_sync_start(self):
@@ -228,7 +229,7 @@ class TestListMembershipsMidSyncListCreation(unittest.TestCase):
             [{"recordId": "a1", "membershipTimestamp": MID_SYNC_MEMBERSHIP_TS}],
         ]
         state["currently_syncing"] = "contact_lists"
-        _, sync2_writes = self.run_contact_lists_sync(
+        _, sync2_writes = run_contact_lists_sync(
             state, AdvancingClock(SYNC_2_START), list_pages, membership_pages)
 
         written_ids = [r["recordId"] for r in sync2_writes.records_for("list_memberships")]
@@ -303,7 +304,7 @@ class TestChildStreamsReceiveParentSyncStartTime(unittest.TestCase):
         tap_hubspot.CONFIG['start_date'] = "2020-01-01T00:00:00Z"
 
         with SingerWritePatches():
-            sync_forms(state, ctx)
+            state = sync_forms(state, ctx)
 
         self.assertEqual(mock_sync_submissions.call_count, 2)
         passed_start_times = {call.args[-1] for call in mock_sync_submissions.call_args_list}
@@ -313,6 +314,80 @@ class TestChildStreamsReceiveParentSyncStartTime(unittest.TestCase):
         self.assertEqual(
             passed_start_times, {SYNC_1_START},
             "every sync_form_submissions call must receive the sync's single start time")
+
+        # A completed run clears its persisted start.
+        self.assertIsNone(
+            singer.bookmarks.get_bookmark(state, "forms", "current_sync_start"))
+
+
+class TestPersistedSyncStart(unittest.TestCase):
+    """
+    The bookmark cap survives interruption: a restarted run reuses the
+    current_sync_start persisted by the run it resumes (instead of re-capturing
+    a fresh, later bound that would let the bookmark ratchet past lists the
+    interrupted runs never reached), and a completed run clears it.
+    """
+
+    PERSISTED_START = datetime(2024, 5, 31, 0, 0, 0, tzinfo=timezone.utc)
+
+    def restarted_state(self):
+        # State as left by an interrupted run that started at PERSISTED_START.
+        return {
+            "currently_syncing": "contact_lists",
+            "bookmarks": {
+                "contact_lists": {
+                    "updatedAt": "2024-01-01T00:00:00.000000Z",
+                    "current_sync_start": "2024-05-31T00:00:00.000000Z",
+                },
+                "list_memberships": {"membershipTimestamp": "2024-01-01T00:00:00.000000Z"},
+            }
+        }
+
+    LIST_PAGES = [{
+        "lists": [{"listId": "A", "updatedAt": "2024-05-01T00:00:00Z", "name": "List A"}],
+        "hasMore": False,
+        "offset": 0,
+    }]
+    MEMBERSHIP_PAGES = [
+        [{"recordId": "a1", "membershipTimestamp": MID_SYNC_MEMBERSHIP_TS}],
+    ]
+
+    def test_restarted_run_reuses_persisted_sync_start(self):
+        # The wall clock says June 1+, but the interrupted run started May 31:
+        # the bookmark cap must stay pinned at May 31.
+        state, _ = run_contact_lists_sync(
+            self.restarted_state(), AdvancingClock(SYNC_1_START),
+            self.LIST_PAGES, self.MEMBERSHIP_PAGES)
+
+        bookmark = singer.bookmarks.get_bookmark(state, "list_memberships", "membershipTimestamp")
+        self.assertEqual(
+            singer.utils.strptime_to_utc(bookmark), self.PERSISTED_START,
+            "restarted run must cap the bookmark at the interrupted run's start")
+
+    def test_completed_run_clears_persisted_sync_start(self):
+        state, _ = run_contact_lists_sync(
+            self.restarted_state(), AdvancingClock(SYNC_1_START),
+            self.LIST_PAGES, self.MEMBERSHIP_PAGES)
+
+        self.assertIsNone(
+            singer.bookmarks.get_bookmark(state, "contact_lists", "current_sync_start"))
+
+    def test_fresh_run_captures_and_uses_the_clock(self):
+        # No persisted start → first clock tick becomes the cap (pre-existing
+        # behavior must be unchanged).
+        fresh_state = {
+            "currently_syncing": "contact_lists",
+            "bookmarks": {
+                "contact_lists": {"updatedAt": "2024-01-01T00:00:00.000000Z"},
+                "list_memberships": {"membershipTimestamp": "2024-01-01T00:00:00.000000Z"},
+            }
+        }
+        state, _ = run_contact_lists_sync(
+            fresh_state, AdvancingClock(SYNC_1_START),
+            self.LIST_PAGES, self.MEMBERSHIP_PAGES)
+
+        bookmark = singer.bookmarks.get_bookmark(state, "list_memberships", "membershipTimestamp")
+        self.assertEqual(singer.utils.strptime_to_utc(bookmark), SYNC_1_START)
 
 
 if __name__ == '__main__':
