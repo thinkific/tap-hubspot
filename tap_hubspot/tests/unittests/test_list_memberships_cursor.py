@@ -161,6 +161,25 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         self.assertEqual(written, ["r1"])
         self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-9"})
 
+    def test_unreadable_list_is_skipped_and_cursor_preserved(self):
+        # A 403 for a list whose object type the token can't read (company /
+        # custom-object lists) surfaces as SourceUnavailableException. It must
+        # skip only that list — not abort the parent stream — and keep any
+        # stored cursor for when the scope is granted.
+        responses = [tap_hubspot.SourceUnavailableException(b'{"status":"error"}')]
+        state, writes, _ = self.run_sync(
+            state_with(cursors={"L1": "CURSOR-1"}), responses)
+
+        self.assertEqual(writes.records_for("list_memberships"), [])
+        self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-1"})
+
+    def test_unreadable_list_without_cursor_is_skipped(self):
+        responses = [tap_hubspot.SourceUnavailableException(b'{"status":"error"}')]
+        state, writes, _ = self.run_sync(state_with(), responses)
+
+        self.assertEqual(writes.records_for("list_memberships"), [])
+        self.assertEqual(self.saved_cursors(state), {})
+
     def test_errors_without_stored_cursor_propagate(self):
         with self.assertRaises(Exception):
             self.run_sync(state_with(), [Exception("Giving up on request")])

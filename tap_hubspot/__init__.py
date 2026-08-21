@@ -982,6 +982,16 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
 
         try:
             latest_cursor = scan(resume_cursor)
+        except SourceUnavailableException as ex:
+            # A list whose member object type this token cannot read (e.g. a
+            # company or custom-object list without the matching read scope)
+            # returns 403. Skip just this list — letting it propagate aborts the
+            # whole contact_lists stream sync, silently skipping every remaining
+            # list. Keep any stored cursor so position isn't lost if the scope
+            # is granted later.
+            LOGGER.warning(
+                "list_memberships: skipping list %s (source unavailable): %s", list_id, ex)
+            latest_cursor = resume_cursor
         except Exception:  # pylint: disable=broad-except
             # request() exhausts its retries and re-raises through on_giveup as a
             # bare Exception, so the underlying HTTPError (e.g. a 400 rejecting a
