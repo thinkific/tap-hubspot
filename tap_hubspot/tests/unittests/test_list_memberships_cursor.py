@@ -109,9 +109,12 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         # the membershipTimestamp filter to avoid re-emitting.
         self.assertEqual(self.saved_cursors(state), {})
 
-    def test_resumed_tail_records_older_than_bookmark_are_not_reemitted(self):
-        # The final page is refetched when the API stopped returning next.after:
-        # records already emitted last sync sit below the bookmark and stay quiet.
+    def test_resumed_scan_emits_records_even_below_the_bookmark(self):
+        # Everything a cursor-resumed scan returns joined after the saved
+        # position, so it is emitted even when the shared stream bookmark has
+        # run ahead of this list (an interrupted sync advances the bookmark off
+        # other lists' progress before this list gets its turn). The refetched
+        # tail page re-emits at most ~250 records, which the target upserts.
         responses = [
             page([member("r4", "2024-05-01T00:00:00Z"),
                   member("r5", "2024-06-15T00:00:00Z")]),
@@ -121,9 +124,22 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
             start="2024-06-01T00:00:00.000000Z")
 
         written = [r["recordId"] for r in writes.records_for("list_memberships")]
-        self.assertEqual(written, ["r5"])
+        self.assertEqual(written, ["r4", "r5"])
         # Cursor is retained even when the resumed scan returned no new one.
         self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-1"})
+
+    def test_full_scan_still_filters_below_bookmark(self):
+        # Without a cursor the whole list is refetched every sync; the bookmark
+        # filter is what stops those records from being re-emitted each time.
+        responses = [
+            page([member("r1", "2024-05-01T00:00:00Z"),
+                  member("r2", "2024-06-15T00:00:00Z")]),
+        ]
+        _, writes, _ = self.run_sync(
+            state_with(), responses, start="2024-06-01T00:00:00.000000Z")
+
+        written = [r["recordId"] for r in writes.records_for("list_memberships")]
+        self.assertEqual(written, ["r2"])
 
     def test_failed_cursor_resume_falls_back_to_full_scan(self):
         # request() surfaces exhausted retries as a bare Exception (on_giveup),
