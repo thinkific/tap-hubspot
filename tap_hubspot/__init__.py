@@ -1069,7 +1069,12 @@ def sync_contact_lists(STATE, ctx):
     STATE = write_current_sync_start(STATE, "contact_lists", sync_start_time)
 
     for _option in sort_options:
-        body = {'count': 250, 'sort': _option}
+        # Restrict to contact lists (objectTypeId 0-1). The stream is
+        # contact_lists; without this filter the v3 search also returns company
+        # and custom-object lists, whose membership reads additionally require
+        # object-type scopes on the token. Note: the filter key is the singular
+        # 'objectTypeId' — the plural form is silently ignored by the API.
+        body = {'count': 250, 'sort': _option, 'objectTypeId': '0-1'}
         with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
             has_more = True
             while has_more:
