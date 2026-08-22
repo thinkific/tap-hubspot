@@ -16,6 +16,7 @@ from test_child_stream_sync_start_time import (
 
 SYNC_START = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
 OLD_BOOKMARK = "2024-01-01T00:00:00.000000Z"
+START_DATE = "2020-01-01T00:00:00Z"
 
 
 def member(record_id, ts):
@@ -48,6 +49,7 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         snapshot of the params dict at each request — get_v3_records mutates the
         dict in place between pages, so the live call_args can't be asserted on."""
         catalog = CATALOGS["list_memberships"]
+        tap_hubspot.CONFIG['start_date'] = START_DATE
         response_iter = iter(responses)
         requested_params = []
 
@@ -101,13 +103,13 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         self.assertEqual(written, ["r4"])
         self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-2"})
 
-    def test_single_page_without_cursor_leaves_no_cursor_to_resume(self):
+    def test_single_page_scan_records_scanned_sentinel(self):
         responses = [page([member("r1", "2024-02-01T00:00:00Z")])]
         state, _, _ = self.run_sync(state_with(), responses)
 
-        # Nothing to resume from; the next sync rescans this list and relies on
-        # the membershipTimestamp filter to avoid re-emitting.
-        self.assertEqual(self.saved_cursors(state), {})
+        # No cursor to resume from, but the list must still be marked as
+        # scanned so later rescans use the bookmark floor, not start_date.
+        self.assertEqual(self.saved_cursors(state), {"L1": ""})
 
     def test_resumed_scan_emits_records_even_below_the_bookmark(self):
         # Everything a cursor-resumed scan returns joined after the saved
@@ -128,18 +130,36 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         # Cursor is retained even when the resumed scan returned no new one.
         self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-1"})
 
-    def test_full_scan_still_filters_below_bookmark(self):
-        # Without a cursor the whole list is refetched every sync; the bookmark
-        # filter is what stops those records from being re-emitted each time.
+    def test_rescan_of_marked_list_still_filters_below_bookmark(self):
+        # A previously-scanned single-page list ('' sentinel) is refetched every
+        # sync; the bookmark filter is what stops re-emission each time.
         responses = [
             page([member("r1", "2024-05-01T00:00:00Z"),
                   member("r2", "2024-06-15T00:00:00Z")]),
         ]
         _, writes, _ = self.run_sync(
-            state_with(), responses, start="2024-06-01T00:00:00.000000Z")
+            state_with(cursors={"L1": ""}), responses,
+            start="2024-06-01T00:00:00.000000Z")
 
         written = [r["recordId"] for r in writes.records_for("list_memberships")]
         self.assertEqual(written, ["r2"])
+
+    def test_first_scan_floors_at_start_date_not_bookmark(self):
+        # A list with no scanned marker has never been emitted: even when the
+        # stream bookmark has run ahead (an interrupted bootstrap advanced it
+        # off other lists' progress), the first scan must emit the list's
+        # history from start_date — not silently drop it below the bookmark.
+        responses = [
+            page([member("r1", "2024-05-01T00:00:00Z"),
+                  member("r2", "2024-06-15T00:00:00Z")]),
+        ]
+        state, writes, _ = self.run_sync(
+            state_with(), responses, start="2024-06-01T00:00:00.000000Z")
+
+        written = [r["recordId"] for r in writes.records_for("list_memberships")]
+        self.assertEqual(written, ["r1", "r2"])
+        # And the completed first scan records the sentinel marker.
+        self.assertEqual(self.saved_cursors(state), {"L1": ""})
 
     def test_failed_cursor_resume_falls_back_to_full_scan(self):
         # request() surfaces exhausted retries as a bare Exception (on_giveup),

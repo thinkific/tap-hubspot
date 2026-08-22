@@ -928,11 +928,15 @@ def sync_email_events(STATE, ctx):
     STATE = sync_entity_chunked(STATE, catalog, "email_events", ["id"], "events")
     return STATE
 
-# State key holding one join-order cursor per list id. The cursors bound how far
-# back the API scan starts; the membershipTimestamp bookmark alone decides what
-# gets emitted. Entries for deleted lists are never pruned: they only cost a few
-# bytes each, while pruning against the parent's snapshot would drop cursors for
-# live lists outside its 10K-record search window.
+# State key holding one entry per list id, doubling as a "scanned to completion
+# at least once" marker: the join-order cursor when the list produced one, or ''
+# (sentinel) for lists that fit in a single uncursored page. A list with NO
+# entry has never been fully scanned, so its first scan is floored at
+# start_date rather than the stream bookmark — the bookmark may have advanced
+# off other lists' progress (interrupted bootstrap) before the list ever got a
+# turn. Entries for deleted lists are never pruned: they only cost a few bytes
+# each, while pruning against the parent's snapshot would drop entries for live
+# lists outside its 10K-record search window.
 LIST_MEMBERSHIPS_CURSOR_KEY = 'join_order_cursors'
 
 def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
@@ -946,7 +950,15 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
     time_extracted = utils.now()
 
     cursors = singer.get_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY) or {}
-    resume_cursor = cursors.pop(list_id, None)
+    # No entry at all = this list has never been scanned to completion: floor
+    # its members at start_date instead of the stream bookmark, or an
+    # interrupted bootstrap would silently drop the list's entire history once
+    # the bookmark has advanced off other lists' progress. ('' is the sentinel
+    # for previously-scanned lists that never produced a cursor.)
+    first_scan = list_id not in cursors
+    resume_cursor = cursors.pop(list_id, None) or None
+    if first_scan:
+        start = CONFIG.get('start_date') or start
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
         def scan(after):
@@ -980,6 +992,7 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
             # contract ever changes.
             return params.get('after')
 
+        skipped = False
         try:
             latest_cursor = scan(resume_cursor)
         except SourceUnavailableException as ex:
@@ -992,6 +1005,7 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
             LOGGER.warning(
                 "list_memberships: skipping list %s (source unavailable): %s", list_id, ex)
             latest_cursor = resume_cursor
+            skipped = True
         except Exception:  # pylint: disable=broad-except
             # request() exhausts its retries and re-raises through on_giveup as a
             # bare Exception, so the underlying HTTPError (e.g. a 400 rejecting a
@@ -1007,8 +1021,14 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
                 "failed; falling back to a full scan of the list", list_id)
             latest_cursor = scan(None)
 
-    if latest_cursor:
-        cursors[list_id] = latest_cursor
+    if skipped:
+        # A skipped list must not gain a scanned marker — restore what it had.
+        if not first_scan:
+            cursors[list_id] = resume_cursor or ''
+    else:
+        # Cursor when there is one, sentinel otherwise: the entry itself marks
+        # the list as scanned to completion at least once.
+        cursors[list_id] = latest_cursor or ''
     STATE = singer.write_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY, cursors)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
