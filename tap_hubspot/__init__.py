@@ -961,14 +961,14 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
         start = CONFIG.get('start_date') or start
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        def scan(after):
+        def scan(after, limit=250):
             """Page the join-order endpoint from `after` (from the beginning when
             None), emitting records at or past `start`. Returns the cursor that
             fetched the final page — None when the scan fit in a single
             uncursored page, in which case there is nothing to resume from and
             the next sync rescans the list."""
             nonlocal max_bk_value
-            params = {'limit': 250}
+            params = {'limit': limit}
             if after:
                 params['after'] = after
             for row in get_v3_records(url, params, "results", "paging"):
@@ -1008,18 +1008,35 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
             skipped = True
         except Exception:  # pylint: disable=broad-except
             # request() exhausts its retries and re-raises through on_giveup as a
-            # bare Exception, so the underlying HTTPError (e.g. a 400 rejecting a
-            # stale cursor) is not observable here. When a stored cursor was in
-            # play, rescan the list from the top before failing the sync — the
-            # membershipTimestamp filter keeps the rescan from re-emitting
-            # already-synced records, and a genuine outage fails the rescan too
-            # and propagates.
-            if not resume_cursor:
-                raise
-            LOGGER.warning(
-                "list_memberships: resuming list %s from its stored join-order cursor "
-                "failed; falling back to a full scan of the list", list_id)
-            latest_cursor = scan(None)
+            # bare Exception, so the underlying HTTPError is not observable here.
+            # Fallback ladder before giving up on the list:
+            #   1. full rescan at the normal page size — covers a stale stored
+            #      cursor being rejected (the membershipTimestamp filter keeps
+            #      the rescan from re-emitting already-synced records);
+            #   2. full rescan at limit=50 — HubSpot has been observed to 500
+            #      deterministically when a 250-record page window spans a bad
+            #      region of a list, while the same region pages fine at 50
+            #      (list 19989, 2026-08-23);
+            #   3. defer the list: skip it WITHOUT a scanned marker so the next
+            #      run retries it, instead of aborting the stream and starving
+            #      every remaining list.
+            ladder = ([(None, 250)] if resume_cursor else []) + [(None, 50)]
+            skipped = True
+            for fallback_after, fallback_limit in ladder:
+                LOGGER.warning(
+                    "list_memberships: scan of list %s failed; retrying with a full "
+                    "scan at page size %s", list_id, fallback_limit)
+                try:
+                    latest_cursor = scan(fallback_after, fallback_limit)
+                    skipped = False
+                    break
+                except Exception:  # pylint: disable=broad-except
+                    continue
+            if skipped:
+                LOGGER.warning(
+                    "list_memberships: deferring list %s after all scan attempts "
+                    "failed; it will be retried on the next run", list_id)
+                latest_cursor = resume_cursor
 
     if skipped:
         # A skipped list must not gain a scanned marker — restore what it had.

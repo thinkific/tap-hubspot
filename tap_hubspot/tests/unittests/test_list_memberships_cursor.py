@@ -200,16 +200,53 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         self.assertEqual(writes.records_for("list_memberships"), [])
         self.assertEqual(self.saved_cursors(state), {})
 
-    def test_errors_without_stored_cursor_propagate(self):
-        with self.assertRaises(Exception):
-            self.run_sync(state_with(), [Exception("Giving up on request")])
-
-    def test_error_in_fallback_scan_propagates(self):
-        # A genuine outage fails the resumed scan AND the fallback rescan; the
-        # second failure must propagate rather than loop.
+    def test_failing_first_scan_is_deferred_without_marker(self):
+        # Initial scan and the limit=50 fallback both fail: the list is skipped
+        # without a scanned marker (so the next run retries it) instead of
+        # aborting the stream for every remaining list.
         responses = [Exception("Giving up on request"), Exception("Giving up on request")]
-        with self.assertRaises(Exception):
-            self.run_sync(state_with(cursors={"L1": "C"}), responses)
+        state, writes, _ = self.run_sync(state_with(), responses)
+
+        self.assertEqual(writes.records_for("list_memberships"), [])
+        self.assertEqual(self.saved_cursors(state), {})
+
+    def test_list_with_cursor_deferred_when_all_scans_fail(self):
+        # Cursor resume, full rescan at 250, and rescan at 50 all fail: defer
+        # the list and keep its stored cursor for the next run's retry.
+        responses = [Exception("giveup"), Exception("giveup"), Exception("giveup")]
+        state, writes, _ = self.run_sync(state_with(cursors={"L1": "C"}), responses)
+
+        self.assertEqual(writes.records_for("list_memberships"), [])
+        self.assertEqual(self.saved_cursors(state), {"L1": "C"})
+
+    def test_page_size_fallback_rescues_bad_page_window(self):
+        # HubSpot can 500 deterministically on a 250-record page window while
+        # the same region pages fine at limit=50 (observed on list 19989).
+        pages_50 = iter([
+            page([member("r1", "2024-02-01T00:00:00Z")], next_after="C-50"),
+            page([member("r2", "2024-03-01T00:00:00Z")]),
+        ])
+        requested = []
+
+        def fake_request(url, params=None):
+            requested.append(dict(params or {}))
+            if params.get("limit") == 250:
+                raise Exception("Giving up on request after 5 tries")
+            return next(pages_50)
+
+        state = state_with()
+        tap_hubspot.CONFIG['start_date'] = START_DATE
+        with SingerWritePatches() as writes, \
+                patch('tap_hubspot.utils.now', return_value=SYNC_START), \
+                patch('tap_hubspot.request', side_effect=fake_request):
+            state, _ = sync_list_memberships(
+                "L1", state, LIST_MEMBERSHIPS_SCHEMA, CATALOGS["list_memberships"],
+                'membershipTimestamp', OLD_BOOKMARK, OLD_BOOKMARK, SYNC_START)
+
+        written = [r["recordId"] for r in writes.records_for("list_memberships")]
+        self.assertEqual(written, ["r1", "r2"])
+        self.assertIn(50, [p.get("limit") for p in requested])
+        self.assertEqual(self.saved_cursors(state), {"L1": "C-50"})
 
     def test_cursors_tracked_independently_per_list(self):
         state = state_with(cursors={"L1": "CURSOR-1"})
