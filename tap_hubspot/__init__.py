@@ -945,6 +945,17 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
     # past the creation time of lists missing from the parent's snapshot, permanently
     # dropping their members on all subsequent syncs.
 
+    # Operator denylist for lists that are broken on HubSpot's side (e.g. list
+    # 19989: one membership page window 500s at every page size and pagination
+    # ignores/wraps the after cursor). Skipping here spends zero requests and
+    # touches no state: removing the id from config later triggers a full
+    # start_date-floored scan if the list has no scanned marker.
+    skip_ids = CONFIG.get('skip_list_memberships_for') or []
+    if str(list_id) in {str(s) for s in skip_ids}:
+        LOGGER.info(
+            "list_memberships: skipping list %s (listed in skip_list_memberships_for)", list_id)
+        return STATE, max_bk_value
+
     mdata = metadata.to_map(catalog.get('metadata'))
     url = get_url("list_memberships", list_id=list_id)
     time_extracted = utils.now()

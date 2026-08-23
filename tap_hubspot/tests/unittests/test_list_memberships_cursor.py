@@ -200,6 +200,32 @@ class TestListMembershipsJoinOrderCursor(unittest.TestCase):
         self.assertEqual(writes.records_for("list_memberships"), [])
         self.assertEqual(self.saved_cursors(state), {})
 
+    def test_denylisted_list_is_skipped_without_any_requests(self):
+        tap_hubspot.CONFIG['skip_list_memberships_for'] = ['L1']
+        try:
+            # No responses provided: any request would raise StopIteration.
+            state, writes, requested = self.run_sync(
+                state_with(cursors={"L1": "CURSOR-1"}), [])
+        finally:
+            tap_hubspot.CONFIG.pop('skip_list_memberships_for', None)
+
+        self.assertEqual(requested, [])
+        self.assertEqual(writes.records_for("list_memberships"), [])
+        # State untouched: existing marker preserved exactly as it was.
+        self.assertEqual(self.saved_cursors(state), {"L1": "CURSOR-1"})
+
+    def test_denylisted_unmarked_list_gains_no_marker(self):
+        tap_hubspot.CONFIG['skip_list_memberships_for'] = [19989]
+        try:
+            state, _, requested = self.run_sync(state_with(), [], list_id="19989")
+        finally:
+            tap_hubspot.CONFIG.pop('skip_list_memberships_for', None)
+
+        self.assertEqual(requested, [])
+        # No marker (state untouched): removing the id from config later
+        # triggers a full start_date-floored first scan.
+        self.assertFalse(self.saved_cursors(state))
+
     def test_failing_first_scan_is_deferred_without_marker(self):
         # Initial scan and the limit=50 fallback both fail: the list is skipped
         # without a scanned marker (so the next run retries it) instead of
