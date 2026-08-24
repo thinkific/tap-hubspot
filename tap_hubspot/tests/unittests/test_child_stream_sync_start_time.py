@@ -320,6 +320,28 @@ class TestChildStreamsReceiveParentSyncStartTime(unittest.TestCase):
             singer.bookmarks.get_bookmark(state, "forms", "current_sync_start"))
 
 
+class TestContactListsObjectTypeFilter(unittest.TestCase):
+    """The contact_lists stream must restrict the v3 search to contact lists
+    (objectTypeId 0-1); other list types belong to other tokens' scopes."""
+
+    @patch('tap_hubspot.post_search_endpoint')
+    @patch('tap_hubspot.load_schema', side_effect=SCHEMAS.__getitem__)
+    @patch('tap_hubspot.utils.now', side_effect=AdvancingClock(SYNC_1_START))
+    def test_search_body_restricts_to_contact_lists(self, mock_now, mock_load_schema, mock_post):
+        mock_post.return_value = MockResponse({"lists": [], "hasMore": False, "offset": 0})
+        state = {
+            "currently_syncing": "contact_lists",
+            "bookmarks": {"contact_lists": {"updatedAt": "2024-01-01T00:00:00.000000Z"}}
+        }
+        tap_hubspot.CONFIG['start_date'] = "2020-01-01T00:00:00Z"
+
+        with SingerWritePatches():
+            sync_contact_lists(state, MockContext(["contact_lists"]))
+
+        for call in mock_post.call_args_list:
+            self.assertEqual(call[0][1].get("objectTypeId"), "0-1")
+
+
 class TestPersistedSyncStart(unittest.TestCase):
     """
     The bookmark cap survives interruption: a restarted run reuses the

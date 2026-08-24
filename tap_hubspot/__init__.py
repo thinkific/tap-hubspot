@@ -928,11 +928,15 @@ def sync_email_events(STATE, ctx):
     STATE = sync_entity_chunked(STATE, catalog, "email_events", ["id"], "events")
     return STATE
 
-# State key holding one join-order cursor per list id. The cursors bound how far
-# back the API scan starts; the membershipTimestamp bookmark alone decides what
-# gets emitted. Entries for deleted lists are never pruned: they only cost a few
-# bytes each, while pruning against the parent's snapshot would drop cursors for
-# live lists outside its 10K-record search window.
+# State key holding one entry per list id, doubling as a "scanned to completion
+# at least once" marker: the join-order cursor when the list produced one, or ''
+# (sentinel) for lists that fit in a single uncursored page. A list with NO
+# entry has never been fully scanned, so its first scan is floored at
+# start_date rather than the stream bookmark — the bookmark may have advanced
+# off other lists' progress (interrupted bootstrap) before the list ever got a
+# turn. Entries for deleted lists are never pruned: they only cost a few bytes
+# each, while pruning against the parent's snapshot would drop entries for live
+# lists outside its 10K-record search window.
 LIST_MEMBERSHIPS_CURSOR_KEY = 'join_order_cursors'
 
 def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, max_bk_value, sync_start_time):
@@ -941,22 +945,41 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
     # past the creation time of lists missing from the parent's snapshot, permanently
     # dropping their members on all subsequent syncs.
 
+    # Operator denylist for lists that are broken on HubSpot's side (e.g. list
+    # 19989: one membership page window 500s at every page size and pagination
+    # ignores/wraps the after cursor). Skipping here spends zero requests and
+    # touches no state: removing the id from config later triggers a full
+    # start_date-floored scan if the list has no scanned marker.
+    skip_ids = CONFIG.get('skip_list_memberships_for') or []
+    if str(list_id) in {str(s) for s in skip_ids}:
+        LOGGER.info(
+            "list_memberships: skipping list %s (listed in skip_list_memberships_for)", list_id)
+        return STATE, max_bk_value
+
     mdata = metadata.to_map(catalog.get('metadata'))
     url = get_url("list_memberships", list_id=list_id)
     time_extracted = utils.now()
 
     cursors = singer.get_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY) or {}
-    resume_cursor = cursors.pop(list_id, None)
+    # No entry at all = this list has never been scanned to completion: floor
+    # its members at start_date instead of the stream bookmark, or an
+    # interrupted bootstrap would silently drop the list's entire history once
+    # the bookmark has advanced off other lists' progress. ('' is the sentinel
+    # for previously-scanned lists that never produced a cursor.)
+    first_scan = list_id not in cursors
+    resume_cursor = cursors.pop(list_id, None) or None
+    if first_scan:
+        start = CONFIG.get('start_date') or start
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        def scan(after):
+        def scan(after, limit=250):
             """Page the join-order endpoint from `after` (from the beginning when
             None), emitting records at or past `start`. Returns the cursor that
             fetched the final page — None when the scan fit in a single
             uncursored page, in which case there is nothing to resume from and
             the next sync rescans the list."""
             nonlocal max_bk_value
-            params = {'limit': 250}
+            params = {'limit': limit}
             if after:
                 params['after'] = after
             for row in get_v3_records(url, params, "results", "paging"):
@@ -980,25 +1003,60 @@ def sync_list_memberships(list_id, STATE, schema, catalog, bookmark_key, start, 
             # contract ever changes.
             return params.get('after')
 
+        skipped = False
         try:
             latest_cursor = scan(resume_cursor)
+        except SourceUnavailableException as ex:
+            # A list whose member object type this token cannot read (e.g. a
+            # company or custom-object list without the matching read scope)
+            # returns 403. Skip just this list — letting it propagate aborts the
+            # whole contact_lists stream sync, silently skipping every remaining
+            # list. Keep any stored cursor so position isn't lost if the scope
+            # is granted later.
+            LOGGER.warning(
+                "list_memberships: skipping list %s (source unavailable): %s", list_id, ex)
+            latest_cursor = resume_cursor
+            skipped = True
         except Exception:  # pylint: disable=broad-except
             # request() exhausts its retries and re-raises through on_giveup as a
-            # bare Exception, so the underlying HTTPError (e.g. a 400 rejecting a
-            # stale cursor) is not observable here. When a stored cursor was in
-            # play, rescan the list from the top before failing the sync — the
-            # membershipTimestamp filter keeps the rescan from re-emitting
-            # already-synced records, and a genuine outage fails the rescan too
-            # and propagates.
-            if not resume_cursor:
-                raise
-            LOGGER.warning(
-                "list_memberships: resuming list %s from its stored join-order cursor "
-                "failed; falling back to a full scan of the list", list_id)
-            latest_cursor = scan(None)
+            # bare Exception, so the underlying HTTPError is not observable here.
+            # Fallback ladder before giving up on the list:
+            #   1. full rescan at the normal page size — covers a stale stored
+            #      cursor being rejected (the membershipTimestamp filter keeps
+            #      the rescan from re-emitting already-synced records);
+            #   2. full rescan at limit=50 — HubSpot has been observed to 500
+            #      deterministically when a 250-record page window spans a bad
+            #      region of a list, while the same region pages fine at 50
+            #      (list 19989, 2026-08-23);
+            #   3. defer the list: skip it WITHOUT a scanned marker so the next
+            #      run retries it, instead of aborting the stream and starving
+            #      every remaining list.
+            ladder = ([(None, 250)] if resume_cursor else []) + [(None, 50)]
+            skipped = True
+            for fallback_after, fallback_limit in ladder:
+                LOGGER.warning(
+                    "list_memberships: scan of list %s failed; retrying with a full "
+                    "scan at page size %s", list_id, fallback_limit)
+                try:
+                    latest_cursor = scan(fallback_after, fallback_limit)
+                    skipped = False
+                    break
+                except Exception:  # pylint: disable=broad-except
+                    continue
+            if skipped:
+                LOGGER.warning(
+                    "list_memberships: deferring list %s after all scan attempts "
+                    "failed; it will be retried on the next run", list_id)
+                latest_cursor = resume_cursor
 
-    if latest_cursor:
-        cursors[list_id] = latest_cursor
+    if skipped:
+        # A skipped list must not gain a scanned marker — restore what it had.
+        if not first_scan:
+            cursors[list_id] = resume_cursor or ''
+    else:
+        # Cursor when there is one, sentinel otherwise: the entry itself marks
+        # the list as scanned to completion at least once.
+        cursors[list_id] = latest_cursor or ''
     STATE = singer.write_bookmark(STATE, 'list_memberships', LIST_MEMBERSHIPS_CURSOR_KEY, cursors)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
@@ -1059,7 +1117,12 @@ def sync_contact_lists(STATE, ctx):
     STATE = write_current_sync_start(STATE, "contact_lists", sync_start_time)
 
     for _option in sort_options:
-        body = {'count': 250, 'sort': _option}
+        # Restrict to contact lists (objectTypeId 0-1). The stream is
+        # contact_lists; without this filter the v3 search also returns company
+        # and custom-object lists, whose membership reads additionally require
+        # object-type scopes on the token. Note: the filter key is the singular
+        # 'objectTypeId' — the plural form is silently ignored by the API.
+        body = {'count': 250, 'sort': _option, 'objectTypeId': '0-1'}
         with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
             has_more = True
             while has_more:
@@ -1106,6 +1169,16 @@ def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, 
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
+        # The v1 submissions endpoint returns newest-first (verified empirically —
+        # AE-404; HubSpot does not document the ordering), so once a record falls
+        # below `start` every remaining record does too and pagination can stop,
+        # making incremental syncs O(new submissions) instead of O(all history).
+        # Because the ordering is undocumented, guard it: exit early only after a
+        # strictly descending step has been observed with no ascending step;
+        # otherwise warn and degrade to the full client-filtered scan.
+        prev_bk_value = None
+        saw_descending = False
+        order_ok = True
         for row in get_v3_records(url, params, "results", "paging"):
             record = bumble_bee.transform(lift_properties_and_versions(row), schema, mdata)
             record['formId'] = form_id
@@ -1114,6 +1187,20 @@ def sync_form_submissions(form_id, STATE, schema, catalog, bookmark_key, start, 
                 singer.write_record("form_submissions", record, catalog.get('stream_alias'), time_extracted=time_extracted)
             if record[bookmark_key] >= max_bk_value:
                 max_bk_value = record[bookmark_key]
+
+            if prev_bk_value is not None:
+                if record[bookmark_key] > prev_bk_value:
+                    if order_ok:
+                        LOGGER.warning(
+                            "form_submissions: form %s returned submissions out of descending "
+                            "order; disabling early exit and scanning fully", form_id)
+                    order_ok = False
+                elif record[bookmark_key] < prev_bk_value:
+                    saw_descending = True
+            prev_bk_value = record[bookmark_key]
+
+            if order_ok and saw_descending and record[bookmark_key] < start:
+                break
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), sync_start_time) if max_bk_value else sync_start_time
