@@ -1,5 +1,5 @@
 # Description of change
-(write a short description or paste a link to JIRA)
+(write a short description or paste a link to the Linear issue)
 
 # Manual QA steps
  - 
